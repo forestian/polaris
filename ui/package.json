@@ -1,6 +1,6 @@
 {
   "name": "polaris-ui",
-  "version": "1.0.10-e1",
+  "version": "1.0.10-e2",
   "private": true,
   "type": "module",
   "scripts": {

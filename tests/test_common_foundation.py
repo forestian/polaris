@@ -415,7 +415,7 @@ class K9sLaunchTests(unittest.TestCase):
 
 class AppLifecycleTests(unittest.TestCase):
     def test_app_uses_polaris_runtime_identity(self):
-        self.assertEqual(polaris.VERSION, '1.0.10-e1')
+        self.assertEqual(polaris.VERSION, '1.0.10-e2')
         self.assertIn('.polaris', str(polaris.PolarisAPI._SESSION_PATH))
         self.assertIn('.polaris', str(polaris.PolarisAPI._SETTINGS_PATH))
         self.assertEqual(polaris._WT_SCHEME_NAME, 'Polaris')

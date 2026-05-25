@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = '1.0.10-e1'   # build.py 정규식 호환 — 무료 빌드 (카탈로그 plugin 제외)
+VERSION = '1.0.10-e2'   # build.py 정규식 호환 — 무료 빌드 (카탈로그 plugin 제외)
 
 # ── 하위 호환 re-export (테스트 + 외부 스크립트가 polaris.X 로 접근 가능) ────
 from src.tools import (

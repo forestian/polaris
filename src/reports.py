@@ -690,7 +690,6 @@ def _report_write_docx(data, findings, llm_fn, out_path, log_fn):
     spacer()
     for txt, sz, clr in [
         (f"점검 일시: {data.get('collected_at', '')}", 12, GRAY),
-        ('작성 조직: Nimbus Networks', 12, GRAY),
         (f"클러스터: {data.get('cluster_version', 'N/A')}", 11, GRAY),
         (f"노드: {len(nodes_all)}개", 11, GRAY),
     ]:
@@ -741,7 +740,6 @@ def _report_write_docx(data, findings, llm_fn, out_path, log_fn):
     tbl(['항목', '내용'], [
         ['클러스터 버전',   data.get('cluster_version', 'N/A')],
         ['점검 일시',       data.get('collected_at', '')],
-        ['작성 조직',       'Nimbus Networks'],
         ['노드 수',         f"{len(nodes_all)}개"],
         ['전체 파드 수',    f"{len(pods_all)}개"],
         ['네임스페이스 수', f"{len(nss)}개"],
