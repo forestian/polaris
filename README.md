@@ -72,11 +72,22 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 - **클러스터 보고서** — DOCX 보고서 생성 (선택적 LLM 분석 포함)
 
 #### UI / UX
-- **시스템 트레이 통합** — 트레이 최소화, 단일 인스턴스 강제
-- **세션 자동 복원** — 클러스터 탭 / 활성 탭 / 페이지 자동 복원
+- **시스템 트레이 통합**
+  - 트레이 아이콘 더블클릭 또는 우클릭 → **"열기"** : 창 복원 (포커스 + 보이기)
+  - 트레이 우클릭 → **"종료"** : 완전 종료 (세션 정리 + 전체 클러스터 disconnect + 프로세스 종료)
+  - **단일 인스턴스 강제** — 두 번째 EXE 실행 시 새 창 띄우지 않고 기존 창만 활성화
+- **세션 자동 복원** — 클러스터 탭 / 활성 탭 / 활성 페이지 / 네임스페이스 모두 복원
 - **명령 팔레트** (⌘K) — 어떤 리소스로도 빠르게 이동
-- **6종 컬러 테마** — polaris (gold) · argus · aurora · forge · vault · pharos
-- **Windows Terminal 컬러 스킴** — Polaris 프로파일 자동 주입
+- **Windows Terminal 컬러 스킴** — Polaris 프로파일 자동 주입 (k9s / 파드 셸에서 적용)
+
+#### 설정 (타이틀바 우측 ⚙ 아이콘)
+- **테마 (배경)** — **6종 컬러 테마 중 선택**, 즉시 적용
+  - `polaris` (Polestar Gold · 기본) · `argus` · `aurora` · `forge` · `vault` · `pharos`
+  - 각 테마마다 배경 / 텍스트 / 액센트 컬러 세트 다름
+- **X 버튼 동작** — `tray` (트레이로 숨김) 또는 `exit` (완전 종료) 토글
+  - 기본값은 `tray` — X 눌러도 트레이에만 들어가고 백그라운드에 계속 실행
+  - `exit` 로 바꾸면 X 누르면 위 "종료" 와 동일하게 완전 종료
+- **세션 자동 복원** — 다음 실행 시 클러스터 탭/페이지 복원 on/off 토글
 
 ### Kubernetes 호환성
 
@@ -202,11 +213,22 @@ DOCX reports — all from one polished UI with the **Polestar Gold** accent on a
 - **Cluster reports** — Generate comprehensive DOCX reports (LLM-powered insights optional)
 
 #### UI / UX
-- **System tray integration** — Minimize to tray, single-instance enforcement
-- **Session auto-restore** — Cluster tabs/active tab/page restored on restart
-- **Command palette** (⌘K) — Jump to any resource quickly
-- **6 color themes** — polaris (gold) · argus · aurora · forge · vault · pharos
-- **Windows Terminal color scheme** — Auto-injects Polaris color profile
+- **System tray integration**
+  - Tray icon double-click or right-click → **"Open"** : restore window (focus + show)
+  - Tray right-click → **"Quit"** : full shutdown (clear session + disconnect all clusters + terminate process)
+  - **Single-instance enforcement** — launching the EXE again only re-focuses the existing window
+- **Session auto-restore** — cluster tabs / active tab / active page / namespace all restored on restart
+- **Command palette** (⌘K) — jump to any resource quickly
+- **Windows Terminal color scheme** — Polaris profile auto-injected for k9s / pod shell
+
+#### Settings (⚙ icon in titlebar)
+- **Theme (background)** — **pick from 6 color themes**, applied instantly
+  - `polaris` (Polestar Gold · default) · `argus` · `aurora` · `forge` · `vault` · `pharos`
+  - Each theme defines its own background / text / accent palette
+- **X button behavior** — toggle between `tray` (hide to tray) and `exit` (full shutdown)
+  - Default is `tray` — closing the window only hides it; Polaris keeps running in the tray
+  - Set to `exit` to make X behave like the tray "Quit" menu (terminate completely)
+- **Session auto-restore** — on/off toggle for restoring cluster tabs/page on next launch
 
 ### Kubernetes Compatibility
 
