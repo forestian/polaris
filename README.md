@@ -12,6 +12,9 @@
 [![Branch](https://img.shields.io/badge/branch-polaris--free-7dd3fc?style=flat-square)](https://github.com/forestian/polaris)
 [![Platform](https://img.shields.io/badge/platform-Windows%2064--bit-c8c4dc?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-MIT-7dd3fc?style=flat-square)](#)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.30--1.36-326CE5?style=flat-square&logo=kubernetes&logoColor=white)](#kubernetes-호환성)
+[![Security Policy](https://img.shields.io/badge/security-policy-7dd3fc?style=flat-square)](./SECURITY.md)
+[![Checksum](https://img.shields.io/badge/checksum-SHA256%2FSHA512-f3c969?style=flat-square)](https://github.com/forestian/polaris/releases)
 [![CI](https://github.com/forestian/polaris/actions/workflows/ci.yml/badge.svg)](https://github.com/forestian/polaris/actions/workflows/ci.yml)
 
 [**한국어**](#-한국어) · [**English**](#-english)
