@@ -109,7 +109,7 @@ Windows에서 처음 실행할 때 SmartScreen 경고가 표시될 수 있습니
 - **명령 팔레트** (Ctrl+K) — 어떤 리소스로도 빠르게 이동
 - **Windows Terminal 컬러 스킴** — Polaris 프로파일 자동 주입 (k9s / 파드 셸에서 적용)
 
-#### 설정 (타이틀바 우측  아이콘)
+#### 설정
 - **테마 (배경)** — **6종 컬러 테마 중 선택**, 즉시 적용
   - `polaris` (Polestar Gold · 기본) · `argus` · `aurora` · `forge` · `vault` · `pharos`
   - 각 테마마다 배경 / 텍스트 / 액센트 컬러 세트 다름
@@ -192,7 +192,7 @@ src/
     └── topology.py   토폴로지 데이터
 ```
 
-기술 스택: **Python 3.12 + kubernetes client + PyWebView + React 18 + Vite + PyInstaller (onefile)**
+기술 스택: **Python 3.13 + kubernetes client + PyWebView + React 18 + Vite + PyInstaller (onefile)**
 
 ### 소스에서 빌드
 
@@ -305,7 +305,7 @@ If you downloaded from the official [GitHub Releases](https://github.com/foresti
 - **Command palette** (Ctrl+K) — jump to any resource quickly
 - **Windows Terminal color scheme** — Polaris profile auto-injected for k9s / pod shell
 
-#### Settings ( icon in titlebar)
+#### Settings
 - **Theme (background)** — **pick from 6 color themes**, applied instantly
   - `polaris` (Polestar Gold · default) · `argus` · `aurora` · `forge` · `vault` · `pharos`
   - Each theme defines its own background / text / accent palette
@@ -389,7 +389,7 @@ src/
     └── topology.py   Topology data
 ```
 
-Tech stack: **Python 3.12 + kubernetes client + PyWebView + React 18 + Vite + PyInstaller (onefile)**
+Tech stack: **Python 3.13 + kubernetes client + PyWebView + React 18 + Vite + PyInstaller (onefile)**
 
 ### Build from source
 
