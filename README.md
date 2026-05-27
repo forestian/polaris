@@ -51,7 +51,7 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 | **v1.0.12-e1** (최신) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | 로그/이벤트 저장·복사, 터미널 drag-copy |
 | v1.0.10-e2 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.10-e2/polaris.exe) | 첫 무료 릴리스 |
 
-> 단일 28 MB EXE. Python / Node.js 설치 불필요. 실행만 하면 됨.
+> 단일 실행 파일. Python / Node.js 설치 불필요. 유효한 kubeconfig와 Kubernetes API 서버 접근 권한이 있으면 실행 가능합니다.
 
 **무결성 검증** (선택):
 - [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
@@ -105,7 +105,7 @@ Windows에서 처음 실행할 때 SmartScreen 경고가 표시될 수 있습니
   - 트레이 우클릭 → **"종료"** : 완전 종료 (세션 정리 + 전체 클러스터 disconnect + 프로세스 종료)
   - **단일 인스턴스 강제** — 두 번째 EXE 실행 시 새 창 띄우지 않고 기존 창만 활성화
 - **세션 자동 복원** — 클러스터 탭 / 활성 탭 / 활성 페이지 / 네임스페이스 모두 복원
-- **명령 팔레트** (⌘K) — 어떤 리소스로도 빠르게 이동
+- **명령 팔레트** (Ctrl+K) — 어떤 리소스로도 빠르게 이동
 - **Windows Terminal 컬러 스킴** — Polaris 프로파일 자동 주입 (k9s / 파드 셸에서 적용)
 
 #### 설정 (타이틀바 우측  아이콘)
@@ -204,7 +204,7 @@ pip install -r requirements.txt
 
 # EXE 빌드 (VERSION/CHANGELOG 동기화 검증, UI 빌드, PyInstaller 실행)
 python build.py
-# → dist/polaris.exe (~27 MB)
+# → dist/polaris.exe
 ```
 
 ### 라이선스
@@ -247,7 +247,7 @@ DOCX reports — all from one polished UI.
 | **v1.0.12-e1** (latest) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | Log/event save & copy, terminal drag-copy |
 | v1.0.10-e2 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.10-e2/polaris.exe) | First free release |
 
-> Single 28 MB executable. No Python or Node.js required. Run and it just works.
+> Single executable. No Python or Node.js required. Requires a valid kubeconfig and access to a Kubernetes API server.
 
 **Integrity verification** (optional):
 - [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
@@ -301,7 +301,7 @@ If you downloaded from the official [GitHub Releases](https://github.com/foresti
   - Tray right-click → **"Quit"** : full shutdown (clear session + disconnect all clusters + terminate process)
   - **Single-instance enforcement** — launching the EXE again only re-focuses the existing window
 - **Session auto-restore** — cluster tabs / active tab / active page / namespace all restored on restart
-- **Command palette** (⌘K) — jump to any resource quickly
+- **Command palette** (Ctrl+K) — jump to any resource quickly
 - **Windows Terminal color scheme** — Polaris profile auto-injected for k9s / pod shell
 
 #### Settings ( icon in titlebar)
@@ -401,7 +401,7 @@ pip install -r requirements.txt
 
 # Build EXE (validates VERSION/CHANGELOG sync, builds UI, runs PyInstaller)
 python build.py
-# → dist/polaris.exe (~27 MB)
+# → dist/polaris.exe
 ```
 
 ### License
