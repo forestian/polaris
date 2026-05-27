@@ -37,9 +37,9 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 
 | | |
 |:---:|:---:|
-| <img src="docs/screenshots/01-pod-browser.png" width="480" alt="리소스 브라우저"> | <img src="docs/screenshots/02-dashboard.png" width="480" alt="대시보드"> |
+| <img src="docs/screenshots/polaris-02-resources.png" width="480" alt="리소스 브라우저"> | <img src="docs/screenshots/polaris-01-dashboard.png" width="480" alt="대시보드"> |
 | **리소스 브라우저** — 파드 목록 + 우측 상세 패널 | **대시보드** — 클러스터 상태 + 노드 CPU/MEM |
-| <img src="docs/screenshots/03-topology.png" width="480" alt="토폴로지"> | <img src="docs/screenshots/04-log-viewer.png" width="480" alt="로그 뷰어"> |
+| <img src="docs/screenshots/polaris-04-topology.png" width="480" alt="토폴로지"> | <img src="docs/screenshots/polaris-03-logs.png" width="480" alt="로그 뷰어"> |
 | **토폴로지 그래프** — Ingress → Service → Workload → Config/Storage | **로그 뷰어** — Deployment / StatefulSet 로그 스트리밍 |
 
 </div>
@@ -233,9 +233,9 @@ DOCX reports — all from one polished UI.
 
 | | |
 |:---:|:---:|
-| <img src="docs/screenshots/01-pod-browser.png" width="480" alt="Resource browser"> | <img src="docs/screenshots/02-dashboard.png" width="480" alt="Dashboard"> |
+| <img src="docs/screenshots/polaris-02-resources.png" width="480" alt="Resource browser"> | <img src="docs/screenshots/polaris-01-dashboard.png" width="480" alt="Dashboard"> |
 | **Resource browser** — pod list with detail panel | **Dashboard** — cluster health + node CPU/MEM |
-| <img src="docs/screenshots/03-topology.png" width="480" alt="Topology"> | <img src="docs/screenshots/04-log-viewer.png" width="480" alt="Log viewer"> |
+| <img src="docs/screenshots/polaris-04-topology.png" width="480" alt="Topology"> | <img src="docs/screenshots/polaris-03-logs.png" width="480" alt="Log viewer"> |
 | **Topology graph** — Ingress → Service → Workload → Config/Storage | **Log viewer** — Deployment / StatefulSet log streaming |
 
 </div>
