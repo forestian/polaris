@@ -104,6 +104,7 @@ export const api = {
 
   // k9s 런처
   launchK9s:         ()              => call('launch_k9s'),
+  installK9s:        ()              => call('install_k9s'),
 
   // 보고서
   openSaveDialog:    (name)          => call('open_save_dialog', name),
@@ -128,5 +129,18 @@ export const api = {
   // 토폴로지 그래프
   getTopologyData: (ns)                           => call('get_topology_data', ns),
 
-  // (free 빌드 v1.0.10-e1) 앱 카탈로그 plugin 제거됨
+  // 앱 카탈로그 (v3.7.13-r1)
+  getCatalog:              ()                                        => callSafe('get_catalog'),
+  detectClusterProfile:    ()                                        => callSafe('detect_cluster_profile'),
+  getCatalogAppValues:     (appId, preset)                           => callSafe('get_catalog_app_values', appId, preset),
+  catalogPreflight:        (appId)                                   => callSafe('catalog_preflight', appId),
+  startCatalogInstall:     (appId, ns, releaseName, valuesYaml)      => callSafe('start_catalog_install', appId, ns, releaseName, valuesYaml),
+  getCatalogInstallStatus: (jobId)                                   => callSafe('get_catalog_install_status', jobId),
+  uninstallCatalogApp:     (releaseName, ns)                         => callSafe('uninstall_catalog_app', releaseName, ns),
+  getInstalledCatalogApps: ()                                        => callSafe('get_installed_catalog_apps'),
+  installHelm:             ()                                        => callSafe('install_helm'),
+
+  // 스택 묶음 설치 (v3.7.13-r7)
+  startStackInstall:       (stackId, preset, appConfigs)            => callSafe('start_stack_install', stackId, preset, appConfigs),
+  getStackInstallStatus:   (jobId)                                  => callSafe('get_stack_install_status', jobId),
 }

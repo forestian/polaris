@@ -109,7 +109,8 @@ class TerminalMixin:
     def launch_k9s(self):
         k9s = _find_k9s()
         if not k9s:
-            return {'ok': False, 'error': 'k9s 실행파일을 찾을 수 없습니다.\n~/.kube/k9s.exe 또는 PATH에 k9s를 설치하세요.'}
+            return {'ok': False, 'not_found': True,
+                    'error': 'k9s 실행파일을 찾을 수 없습니다.'}
         try:
             env = {**os.environ}
             if self.k8s.kubeconfig:
@@ -120,6 +121,63 @@ class TerminalMixin:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             return {'ok': True, 'terminal': terminal}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
+    def install_k9s(self) -> dict:
+        """GitHub releases에서 k9s 최신 버전을 다운로드하여 ~/.kube/k9s.exe 에 설치."""
+        import io
+        import json
+        import zipfile
+        import urllib.request
+        import src.tools as _tools
+
+        try:
+            # 1. 최신 릴리스 메타데이터 조회
+            api_url = 'https://api.github.com/repos/derailed/k9s/releases/latest'
+            req = urllib.request.Request(api_url, headers={'User-Agent': 'polaris-app'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                release = json.loads(resp.read())
+
+            tag = release['tag_name']
+
+            # 2. Windows amd64 zip asset URL 탐색 (없으면 표준 URL 구성)
+            asset_url = next(
+                (a['browser_download_url'] for a in release.get('assets', [])
+                 if 'windows' in a['name'].lower()
+                 and 'amd64' in a['name'].lower()
+                 and a['name'].lower().endswith('.zip')),
+                f'https://github.com/derailed/k9s/releases/download/{tag}/k9s_Windows_amd64.zip',
+            )
+
+            # 3. zip 다운로드
+            req = urllib.request.Request(asset_url, headers={'User-Agent': 'polaris-app'})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                zip_data = resp.read()
+
+            # 4. zip에서 k9s.exe 추출
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                exe_entry = next(
+                    (n for n in zf.namelist()
+                     if os.path.basename(n).lower() in ('k9s.exe', 'k9s')),
+                    None,
+                )
+                if not exe_entry:
+                    return {'ok': False, 'error': 'zip 파일에서 k9s.exe를 찾을 수 없습니다.'}
+                exe_data = zf.read(exe_entry)
+
+            # 5. ~/.kube/k9s.exe 로 저장
+            dest = _tools._K9S_LOCAL
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(exe_data)
+
+            # 6. 탐색 캐시 초기화 → 다음 _find_k9s() 에서 정상 검출
+            _tools._k9s_cached = None
+
+            return {'ok': True, 'version': tag, 'path': dest}
+
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
