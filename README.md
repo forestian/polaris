@@ -12,6 +12,7 @@
 [![Branch](https://img.shields.io/badge/branch-polaris--free-7dd3fc?style=flat-square)](https://github.com/forestian/polaris)
 [![Platform](https://img.shields.io/badge/platform-Windows%2064--bit-c8c4dc?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-MIT-7dd3fc?style=flat-square)](#)
+[![CI](https://github.com/forestian/polaris/actions/workflows/ci.yml/badge.svg)](https://github.com/forestian/polaris/actions/workflows/ci.yml)
 
 [**한국어**](#-한국어) · [**English**](#-english)
 

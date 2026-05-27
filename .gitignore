@@ -27,6 +27,10 @@ config
 !catalog/**/*.yaml
 !catalog/**/*.yml
 
+# GitHub Actions 워크플로우는 트래킹 대상 (예외)
+!.github/**/*.yml
+!.github/**/*.yaml
+
 # Claude Code 세션 데이터
 .claude/
 
