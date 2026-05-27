@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="packaging/icons/polaris-256.png" width="128" height="128" alt="Polaris logo">
+<img src="docs/polaris-banner.png" alt="POLARIS">
 
 # POLARIS
 
@@ -22,7 +22,7 @@
 <a id="-한국어"></a>
 
 <details open>
-<summary><h2>🇰🇷 한국어</h2></summary>
+<summary><h2> 한국어</h2></summary>
 
 ### Polaris 란?
 
@@ -85,7 +85,7 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 - **명령 팔레트** (⌘K) — 어떤 리소스로도 빠르게 이동
 - **Windows Terminal 컬러 스킴** — Polaris 프로파일 자동 주입 (k9s / 파드 셸에서 적용)
 
-#### 설정 (타이틀바 우측 ⚙ 아이콘)
+#### 설정 (타이틀바 우측  아이콘)
 - **테마 (배경)** — **6종 컬러 테마 중 선택**, 즉시 적용
   - `polaris` (Polestar Gold · 기본) · `argus` · `aurora` · `forge` · `vault` · `pharos`
   - 각 테마마다 배경 / 텍스트 / 액센트 컬러 세트 다름
@@ -98,10 +98,10 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 
 | 범위 | 상태 |
 |---|---|
-| **K8s 1.34, 1.35** | ✅ 검증 완료 |
-| **K8s 1.30 ~ 1.36** | 🟢 권장 |
-| **K8s 1.22 ~ 1.29** | 🟡 코어 기능만 |
-| **K8s ≤ 1.21 / ≥ 1.37** | ⚠️ 미검증 |
+| **K8s 1.34, 1.35** |  검증 완료 |
+| **K8s 1.30 ~ 1.36** |  권장 |
+| **K8s 1.22 ~ 1.29** |  코어 기능만 |
+| **K8s ≤ 1.21 / ≥ 1.37** |  미검증 |
 
 Polaris 는 v1 stable API (`CoreV1` / `AppsV1` / `BatchV1` / `NetworkingV1` /
 `RbacV1` / `StorageV1` / `AutoscalingV1` / `PolicyV1`) 만 사용해 광범위하게 호환됩니다.
@@ -167,7 +167,7 @@ python build.py
 <a id="-english"></a>
 
 <details>
-<summary><h2>🇬🇧 English</h2></summary>
+<summary><h2> English</h2></summary>
 
 ### What is Polaris?
 
@@ -231,7 +231,7 @@ DOCX reports — all from one polished UI with the **Polestar Gold** accent on a
 - **Command palette** (⌘K) — jump to any resource quickly
 - **Windows Terminal color scheme** — Polaris profile auto-injected for k9s / pod shell
 
-#### Settings (⚙ icon in titlebar)
+#### Settings ( icon in titlebar)
 - **Theme (background)** — **pick from 6 color themes**, applied instantly
   - `polaris` (Polestar Gold · default) · `argus` · `aurora` · `forge` · `vault` · `pharos`
   - Each theme defines its own background / text / accent palette
@@ -244,10 +244,10 @@ DOCX reports — all from one polished UI with the **Polestar Gold** accent on a
 
 | Range | Status |
 |---|---|
-| **K8s 1.34, 1.35** | ✅ Verified |
-| **K8s 1.30 ~ 1.36** | 🟢 Recommended |
-| **K8s 1.22 ~ 1.29** | 🟡 Supported (core features only) |
-| **K8s ≤ 1.21 / ≥ 1.37** | ⚠️ Unverified |
+| **K8s 1.34, 1.35** |  Verified |
+| **K8s 1.30 ~ 1.36** |  Recommended |
+| **K8s 1.22 ~ 1.29** |  Supported (core features only) |
+| **K8s ≤ 1.21 / ≥ 1.37** |  Unverified |
 
 Polaris uses only stable v1 APIs (`CoreV1` / `AppsV1` / `BatchV1` / `NetworkingV1` /
 `RbacV1` / `StorageV1` / `AutoscalingV1` / `PolicyV1`), so the compatibility range
