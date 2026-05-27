@@ -31,6 +31,19 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 클러스터에 연결해 리소스 탐색 / 로그 스트리밍 / kubectl/k9s 실행 / DOCX 보고서
 생성을 한 UI 에서.
 
+### 스크린샷
+
+<div align="center">
+
+| | |
+|:---:|:---:|
+| <img src="docs/screenshots/01-pod-browser.png" width="480" alt="리소스 브라우저"> | <img src="docs/screenshots/02-dashboard.png" width="480" alt="대시보드"> |
+| **리소스 브라우저** — 파드 목록 + 우측 상세 패널 | **대시보드** — 클러스터 상태 + 노드 CPU/MEM |
+| <img src="docs/screenshots/03-topology.png" width="480" alt="토폴로지"> | <img src="docs/screenshots/04-log-viewer.png" width="480" alt="로그 뷰어"> |
+| **토폴로지 그래프** — Ingress → Service → Workload → Config/Storage | **로그 뷰어** — Deployment / StatefulSet 로그 스트리밍 |
+
+</div>
+
 ### 다운로드
 
 | 버전 | 다운로드 | 비고 |
@@ -44,6 +57,19 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 - [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
 - **PowerShell**: `Get-FileHash polaris.exe -Algorithm SHA256` → 출력된 Hash 값을 위 파일 내용과 비교
 - **Bash / Git Bash** (sha256 파일을 polaris.exe 와 같은 폴더에 두고): `sha256sum -c polaris.exe.sha256` → `polaris.exe: OK`
+
+### ⚠️ Windows SmartScreen 경고
+
+현재 Polaris EXE는 코드서명 인증서로 서명되어 있지 않습니다.
+Windows에서 처음 실행할 때 SmartScreen 경고가 표시될 수 있습니다.
+
+공식 [GitHub Releases](https://github.com/forestian/polaris/releases)에서 다운로드한 파일이라면 아래 순서로 실행할 수 있습니다:
+
+1. **추가 정보** 클릭
+2. **실행** 클릭
+
+> SHA256/SHA512 체크섬으로 파일 무결성을 먼저 확인하는 것을 권장합니다.  
+> 향후 코드서명 적용을 검토 중입니다.
 
 ### 주요 기능
 
@@ -114,6 +140,34 @@ Polaris 는 v1 stable API (`CoreV1` / `AppsV1` / `BatchV1` / `NetworkingV1` /
 
 멀티 클러스터: `+` 한 번 더 클릭 후 다른 kubeconfig 추가. 탭으로 전환.
 
+### 트러블슈팅
+
+**SmartScreen 경고가 표시됩니다**  
+공식 GitHub Releases 에서 받은 파일인지 확인 후 SHA256 체크섬을 검증하세요.
+이상 없으면 **추가 정보 → 실행** 으로 실행 가능합니다.
+
+**클러스터에 연결되지 않습니다**  
+- kubeconfig 경로와 선택한 컨텍스트를 확인하세요
+- VPN / 네트워크 연결 상태를 확인하세요
+- Kubernetes API 서버에 직접 도달 가능한지 확인하세요 (`kubectl cluster-info`)
+- 인증서 오류 또는 프록시 설정을 점검하세요
+
+**메트릭(CPU/MEM)이 표시되지 않습니다**  
+파드·노드 메트릭은 클러스터에 `metrics.k8s.io` API가 필요합니다.
+`metrics-server` 설치 여부를 확인하거나, 클러스터의 메트릭 API 노출 여부를 점검하세요.
+
+**k9s가 열리지 않습니다**  
+Polaris는 k9s를 자동 설치하지 않습니다.
+`PATH` 또는 `~/.kube/k9s.exe` 에 k9s를 설치하세요 → [k9s 설치 가이드](https://k9scli.io/topics/install/)
+
+**Helm 릴리스가 보이지 않습니다**  
+- `helm` CLI 가 PATH 에 있거나 `~/.kube/helm.exe` 로 설치돼 있는지 확인하세요
+- 해당 네임스페이스에 Helm 릴리스 Secret 이 존재하는지 확인하세요
+
+**ArgoCD 페이지가 비어 있습니다**  
+ArgoCD 연동은 클러스터에 ArgoCD Application CRD 가 설치돼 있어야 합니다.
+ArgoCD가 배포된 클러스터에 연결됐는지 확인하세요.
+
 ### 아키텍처 (개발자용)
 
 ```
@@ -173,6 +227,19 @@ Built with PyWebView + React, runs without Python installation. Connect to your
 clusters via kubeconfig, browse resources, stream logs, run kubectl/k9s, generate
 DOCX reports — all from one polished UI.
 
+### Screenshots
+
+<div align="center">
+
+| | |
+|:---:|:---:|
+| <img src="docs/screenshots/01-pod-browser.png" width="480" alt="Resource browser"> | <img src="docs/screenshots/02-dashboard.png" width="480" alt="Dashboard"> |
+| **Resource browser** — pod list with detail panel | **Dashboard** — cluster health + node CPU/MEM |
+| <img src="docs/screenshots/03-topology.png" width="480" alt="Topology"> | <img src="docs/screenshots/04-log-viewer.png" width="480" alt="Log viewer"> |
+| **Topology graph** — Ingress → Service → Workload → Config/Storage | **Log viewer** — Deployment / StatefulSet log streaming |
+
+</div>
+
 ### Download
 
 | Version | Download | Notes |
@@ -186,6 +253,19 @@ DOCX reports — all from one polished UI.
 - [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
 - **PowerShell**: `Get-FileHash polaris.exe -Algorithm SHA256` → compare the printed Hash with the contents of the .sha256 file
 - **Bash / Git Bash** (with the .sha256 file next to polaris.exe): `sha256sum -c polaris.exe.sha256` → `polaris.exe: OK`
+
+### ⚠️ Windows SmartScreen Warning
+
+Polaris EXE is currently not signed with a code-signing certificate.
+Windows SmartScreen may display a warning on first launch.
+
+If you downloaded from the official [GitHub Releases](https://github.com/forestian/polaris/releases):
+
+1. Click **More info**
+2. Click **Run anyway**
+
+> We recommend verifying the SHA256/SHA512 checksum before running.  
+> Code signing is planned for a future release.
 
 ### Features
 
@@ -256,6 +336,34 @@ ArgoCD Application CRD (for ArgoCD page).
 5. Explore: Dashboard → Resources → Topology → Reports
 
 For multi-cluster: click `+` again, add another kubeconfig. Switch with tabs.
+
+### Troubleshooting
+
+**SmartScreen warning appears**  
+Verify you downloaded from the official GitHub Releases page and check the SHA256 checksum.
+If the file is valid, click **More info → Run anyway**.
+
+**Cannot connect to cluster**  
+- Check the kubeconfig path and selected context
+- Check VPN / network connectivity
+- Verify the Kubernetes API server is reachable (`kubectl cluster-info`)
+- Inspect certificate errors or proxy settings
+
+**Metrics (CPU/MEM) are not showing**  
+Pod and node metrics require the `metrics.k8s.io` API.
+Check whether `metrics-server` is installed or if your cluster exposes the metrics API.
+
+**k9s does not open**  
+Polaris does not auto-install k9s.
+Install k9s in your `PATH` or at `~/.kube/k9s.exe` → [k9s installation guide](https://k9scli.io/topics/install/)
+
+**Helm releases are not visible**  
+- Ensure `helm` is available in your `PATH` or installed at `~/.kube/helm.exe`
+- Check that Helm release Secrets exist in the target namespace
+
+**ArgoCD page is empty**  
+The ArgoCD integration requires ArgoCD Application CRDs installed in the cluster.
+Make sure you are connected to a cluster where ArgoCD is deployed.
 
 ### Architecture (for developers)
 
