@@ -29,11 +29,7 @@
 윈도우용 **단일 EXE 쿠버네티스 클러스터 관리 데스크톱 앱**.
 PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. kubeconfig 로
 클러스터에 연결해 리소스 탐색 / 로그 스트리밍 / kubectl/k9s 실행 / DOCX 보고서
-생성을 한 UI 에서. **Midnight Indigo** 배경에 **Polestar Gold** 액센트.
-
-> **이건 무료 빌드 (`-e1`)** — 앱 카탈로그 (Helm 스택 원클릭 설치) 기능은
-> 제외돼 있습니다. LGTM 스택 자동 설치가 포함된 풀패키지는 별도 유료 빌드로
-> 배포됩니다.
+생성을 한 UI 에서.
 
 ### 다운로드
 
@@ -175,12 +171,7 @@ python build.py
 A **single-EXE desktop application** for managing Kubernetes clusters on Windows.
 Built with PyWebView + React, runs without Python installation. Connect to your
 clusters via kubeconfig, browse resources, stream logs, run kubectl/k9s, generate
-DOCX reports — all from one polished UI with the **Polestar Gold** accent on a
-**Midnight Indigo** theme.
-
-> **This is the free build (`-e1`)** — the app catalog feature (one-click Helm
-> stack installation) is excluded. The full package with LGTM stack auto-install
-> is distributed separately as a paid build.
+DOCX reports — all from one polished UI.
 
 ### Download
 
