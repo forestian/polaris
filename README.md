@@ -6,9 +6,9 @@
 
 ### Kubernetes Cluster Management GUI for Windows
 
-**Free Build (no app catalog)** · v1.0.12-e1
+**Free Build (no app catalog)** · v1.0.13-e1
 
-[![Latest](https://img.shields.io/badge/release-v1.0.12--e1-f3c969?style=flat-square)](https://github.com/forestian/polaris/releases)
+[![Latest](https://img.shields.io/badge/release-v1.0.13--e1-f3c969?style=flat-square)](https://github.com/forestian/polaris/releases)
 [![Branch](https://img.shields.io/badge/branch-polaris--free-7dd3fc?style=flat-square)](https://github.com/forestian/polaris)
 [![Platform](https://img.shields.io/badge/platform-Windows%2064--bit-c8c4dc?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-MIT-7dd3fc?style=flat-square)](#)
@@ -49,13 +49,13 @@ PyWebView + React 로 만들어졌고, 파이썬 설치 없이 실행됩니다. 
 
 | 버전 | 다운로드 | 비고 |
 |---|---|---|
-| **v1.0.12-e1** (최신) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | 로그/이벤트 저장·복사, 터미널 drag-copy |
-| v1.0.10-e2 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.10-e2/polaris.exe) | 첫 무료 릴리스 |
+| **v1.0.13-e1** (최신) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe) | k9s 원클릭 설치 |
+| v1.0.12-e1 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | 로그/이벤트 저장·복사, 터미널 drag-copy |
 
 > 단일 실행 파일. Python / Node.js 설치 불필요. 유효한 kubeconfig와 Kubernetes API 서버 접근 권한이 있으면 실행 가능합니다.
 
 **무결성 검증** (선택):
-- [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
+- [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe.sha512)
 - **PowerShell**: `Get-FileHash polaris.exe -Algorithm SHA256` → 출력된 Hash 값을 위 파일 내용과 비교
 - **Bash / Git Bash** (sha256 파일을 polaris.exe 와 같은 폴더에 두고): `sha256sum -c polaris.exe.sha256` → `polaris.exe: OK`
 
@@ -133,7 +133,7 @@ Polaris 는 v1 stable API (`CoreV1` / `AppsV1` / `BatchV1` / `NetworkingV1` /
 
 ### 빠른 시작
 
-1. [`polaris.exe`](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) 다운로드
+1. [`polaris.exe`](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe) 다운로드
 2. 실행 — 설치 불필요
 3. 타이틀바 `+` → kubeconfig 탐색
 4. 컨텍스트 선택 (또는 현재값 유지) → 연결
@@ -245,13 +245,13 @@ DOCX reports — all from one polished UI.
 
 | Version | Download | Notes |
 |---|---|---|
-| **v1.0.12-e1** (latest) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | Log/event save & copy, terminal drag-copy |
-| v1.0.10-e2 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.10-e2/polaris.exe) | First free release |
+| **v1.0.13-e1** (latest) | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe) | k9s one-click install |
+| v1.0.12-e1 | [polaris.exe](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe) | Log/event save & copy, terminal drag-copy |
 
 > Single executable. No Python or Node.js required. Requires a valid kubeconfig and access to a Kubernetes API server.
 
 **Integrity verification** (optional):
-- [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe.sha512)
+- [polaris.exe.sha256](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe.sha256) · [polaris.exe.sha512](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe.sha512)
 - **PowerShell**: `Get-FileHash polaris.exe -Algorithm SHA256` → compare the printed Hash with the contents of the .sha256 file
 - **Bash / Git Bash** (with the .sha256 file next to polaris.exe): `sha256sum -c polaris.exe.sha256` → `polaris.exe: OK`
 
@@ -330,7 +330,7 @@ ArgoCD Application CRD (for ArgoCD page).
 
 ### Quick Start
 
-1. Download [`polaris.exe`](https://github.com/forestian/polaris/releases/download/v1.0.12-e1/polaris.exe)
+1. Download [`polaris.exe`](https://github.com/forestian/polaris/releases/download/v1.0.13-e1/polaris.exe)
 2. Run it — no installation needed
 3. Title bar `+` → Browse your kubeconfig
 4. Select a context (or accept current) → Connect
