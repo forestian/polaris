@@ -13,7 +13,7 @@ Only the latest release receives security fixes.
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Send a report to: **nimbusnw@nimbusnetworks.co.kr**
+Send a report to: **nwcloud@nimbusnetworks.co.kr**
 
 Include the following in your report:
 
