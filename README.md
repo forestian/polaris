@@ -92,7 +92,7 @@ Windows에서 처음 실행할 때 SmartScreen 경고가 표시될 수 있습니
 
 #### 운영
 - **kubectl 터미널** — 빌트인 터미널, 스트리밍 명령 자동 감지
-- **k9s 런처** — Polaris 컬러 스킴 적용된 Windows Terminal 에서 k9s 실행
+- **k9s 런처** — Polaris 컬러 스킴 적용된 Windows Terminal 에서 k9s 실행, 미설치 시 **원클릭 설치** 버튼 제공
 - **파드 셸** — 원클릭 `kubectl exec -it ... -- sh` 새 터미널에서
 - **포트포워딩 GUI** — 시각적 포트포워드 관리 (시작/중지/목록)
 - **CronJob 즉시 실행** — 스케줄 수정 없이 수동 실행
@@ -161,8 +161,8 @@ Polaris 는 v1 stable API (`CoreV1` / `AppsV1` / `BatchV1` / `NetworkingV1` /
 `metrics-server` 설치 여부를 확인하거나, 클러스터의 메트릭 API 노출 여부를 점검하세요.
 
 **k9s가 열리지 않습니다**  
-Polaris는 k9s를 자동 설치하지 않습니다.
-`PATH` 또는 `~/.kube/k9s.exe` 에 k9s를 설치하세요 → [k9s 설치 가이드](https://k9scli.io/topics/install/)
+k9s가 `PATH` 또는 `~/.kube/k9s.exe` 에 없으면, k9s 페이지의 **원클릭 설치** 버튼으로 GitHub 최신 릴리스에서 자동 설치할 수 있습니다 (`~/.kube/k9s.exe` 에 저장).
+설치 후에도 열리지 않으면 [k9s 설치 가이드](https://k9scli.io/topics/install/) 를 참고해 수동 설치하세요.
 
 **Helm 릴리스가 보이지 않습니다**  
 - `helm` CLI 가 PATH 에 있거나 `~/.kube/helm.exe` 로 설치돼 있는지 확인하세요
@@ -288,7 +288,7 @@ If you downloaded from the official [GitHub Releases](https://github.com/foresti
 
 #### Operations
 - **kubectl terminal** — Built-in terminal with streaming command auto-detection
-- **k9s launcher** — Opens k9s in Windows Terminal with Polaris color scheme
+- **k9s launcher** — Opens k9s in Windows Terminal with Polaris color scheme; **one-click install** when not found
 - **Pod shell** — One-click `kubectl exec -it ... -- sh` in a new terminal
 - **Port-forwarding GUI** — Visual port-forward management (start/stop/list)
 - **CronJob trigger** — Manually run CronJobs without modifying schedules
@@ -358,8 +358,8 @@ Pod and node metrics require the `metrics.k8s.io` API.
 Check whether `metrics-server` is installed or if your cluster exposes the metrics API.
 
 **k9s does not open**  
-Polaris does not auto-install k9s.
-Install k9s in your `PATH` or at `~/.kube/k9s.exe` → [k9s installation guide](https://k9scli.io/topics/install/)
+If k9s is not in your `PATH` or at `~/.kube/k9s.exe`, use the **one-click install** button on the k9s page to fetch the latest release from GitHub (saved to `~/.kube/k9s.exe`).
+If it still does not open after installing, install manually → [k9s installation guide](https://k9scli.io/topics/install/)
 
 **Helm releases are not visible**  
 - Ensure `helm` is available in your `PATH` or installed at `~/.kube/helm.exe`
