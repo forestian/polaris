@@ -107,6 +107,7 @@ export const api = {
 
   // 보고서
   openSaveDialog:    (name)          => call('open_save_dialog', name),
+  saveTextFile:      (content, filename) => callSafe('save_text_file', content, filename),
   generateReport:    (cfg)           => call('generate_report', cfg),
   startReport:       (cfg)           => call('start_report', cfg),
   getJobStatus:      (id)            => call('get_job_status', id),

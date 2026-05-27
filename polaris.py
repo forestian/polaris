@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = '1.0.10-e2'   # build.py 정규식 호환 — 무료 빌드 (카탈로그 plugin 제외)
+VERSION = '1.0.12-e1'   # build.py 정규식 호환 — 무료 빌드 (카탈로그 plugin 제외)
 
 # ── 하위 호환 re-export (테스트 + 외부 스크립트가 polaris.X 로 접근 가능) ────
 from src.tools import (
@@ -103,8 +103,30 @@ from src.runtime import (
 )
 
 
+def _selfcheck() -> int:
+    """GUI 없이 빌드 무결성 점검 (frozen EXE 에서도 동작).
+
+    사용:  polaris.exe --selfcheck
+    출력:  버전 / frozen 여부 / 활성 옵셔널 plugin / 핵심 API 메서드 노출 여부.
+    """
+    import json
+    report = {
+        'version':          VERSION,
+        'frozen':           bool(getattr(sys, 'frozen', False)),
+        'enabled_features': list(ENABLED_FEATURES),
+        'api_methods': {
+            name: hasattr(PolarisAPI, name)
+            for name in ('get_status', 'get_dashboard', 'get_catalog')
+        },
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main():
     """진입점. src.runtime.main 에 VERSION 과 PolarisAPI 를 주입해 실행."""
+    if '--selfcheck' in sys.argv:
+        sys.exit(_selfcheck())
     _runtime_main(VERSION, PolarisAPI)
 
 

@@ -11,7 +11,7 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
-import { Activity, RefreshCw, AlertCircle } from 'lucide-react'
+import { Activity, RefreshCw, AlertCircle, Copy, Check, Download } from 'lucide-react'
 
 const RANGES = [
   { id: '1h',  label: '1시간',  ms:    60 * 60 * 1000, bucketMs:  60 * 1000 },  // 1 min
@@ -48,6 +48,7 @@ export default function EventsPage() {
   const [source, setSource]     = useState(null)    // 어느 방식으로 수집했는지
   const [attempts, setAttempts] = useState([])      // 시도 내역 (디버그용)
   const [bucketSel, setBucketSel] = useState(null)   // 선택된 버킷의 [startMs, endMs]
+  const [copied, setCopied] = useState(false)
 
   const range = RANGES.find(r => r.id === rangeId) || RANGES[1]
 
@@ -150,6 +151,38 @@ export default function EventsPage() {
     return s + (e.type === 'Normal' ? (e.count || 1) : 0)
   }, 0), [events, winStart])
 
+  function eventsToTSV(evts) {
+    const header = '시각\t타입\t이유\t대상\t네임스페이스\t메시지\t횟수'
+    const rows = evts.map(e => {
+      const ts = parseTs(e.last_time)
+      return [
+        ts ? fmtFull(ts) : '',
+        e.type || '',
+        e.reason || '',
+        e.obj || '',
+        e.namespace || '',
+        (e.message || '').replace(/\t/g, ' '),
+        e.count ?? '',
+      ].join('\t')
+    })
+    return [header, ...rows].join('\n')
+  }
+
+  async function copyEvents() {
+    if (filtered.length === 0) return
+    try {
+      await navigator.clipboard.writeText(eventsToTSV(filtered))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {}
+  }
+
+  async function downloadEvents() {
+    if (filtered.length === 0) return
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
+    await api.saveTextFile(eventsToTSV(filtered), `events-${stamp}.tsv`)
+  }
+
   if (!connected) {
     return (
       <div className="empty-state" style={{ height: '100%' }}>
@@ -221,6 +254,18 @@ export default function EventsPage() {
             onChange={e => setAutoRefresh(e.target.checked)} />
           자동
         </label>
+
+        <button className="btn btn-ghost btn-sm" onClick={copyEvents}
+          disabled={filtered.length === 0} style={{ gap: 4 }} title="표 내용 복사 (TSV)">
+          {copied ? <Check size={11} color="var(--green)" /> : <Copy size={11} />}
+          {copied ? '복사됨' : '복사'}
+        </button>
+
+        <button className="btn btn-ghost btn-sm" onClick={downloadEvents}
+          disabled={filtered.length === 0} style={{ gap: 4 }} title="TSV 파일로 저장">
+          <Download size={11} />
+          저장
+        </button>
 
         <button className="btn btn-default btn-sm" onClick={load} disabled={loading}>
           <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />

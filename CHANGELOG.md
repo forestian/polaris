@@ -19,7 +19,22 @@
 - 새 plugin 추가 시 별도 `CHANGELOG-<plugin>.md` 운영 권장
 
 > **v1.0.2 이전 표기 규칙** (`-rN` = 실험적): 옛 안정 트랙은 `v3-v1` 브랜치에 아카이브.
-> 이전 Bastion (v2.x ~ v3.8.x) 의 모든 변경 내역은 [`CHANGELOG_BASTION_HISTORY.md`](./CHANGELOG_BASTION_HISTORY.md) 를 참고하세요.
+
+---
+
+## v1.0.12-e1 — 2026-05-27  ·  UX 개선 — 로그/이벤트 저장·복사, 터미널 drag-copy
+
+### 추가
+- **로그 뷰어** (`LogPage`): 저장 버튼 — 현재 필터 결과를 `.log` 파일로 내보내기
+- **이벤트 타임라인** (`EventsPage`): 복사(TSV) · 저장 버튼 — 필터된 이벤트 목록
+- **kubectl 터미널** (`TerminalPage`):
+  - 전체 출력 복사 버튼 추가
+  - 출력 영역 드래그 텍스트 선택 시 포커스 이동 차단 (drag-copy 버그 수정)
+- **리소스 패널** (`ResourcePanel`): YAML/Describe 복사 버튼을 스크롤바 겹침 없이 좌측 이동
+- **진단 플래그** `--selfcheck`: 버전 / frozen 여부 / 활성 plugin 확인 (EXE 빌드 무결성 점검)
+
+### 참고
+- 앱 카탈로그 plugin 은 이 variant 에 포함되지 않습니다.
 
 ---
 

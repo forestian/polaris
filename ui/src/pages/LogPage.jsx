@@ -12,7 +12,7 @@ import {
 import {
   Play, Square, RefreshCw, Search, Trash2,
   ChevronDown, ScrollText, ToggleLeft, ToggleRight,
-  ArrowDown, Copy, Check,
+  ArrowDown, Copy, Check, Download,
 } from 'lucide-react'
 
 function lineColor(line) {
@@ -275,6 +275,14 @@ export default function LogPage() {
     } catch {}
   }
 
+  async function downloadAll() {
+    const text = filtered.join('\n')
+    if (!text) return
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
+    const base = String(pod || sourceType || 'logs').replace(/[^\w.-]/g, '_')
+    await api.saveTextFile(text, `${base}-${stamp}.log`)
+  }
+
   const filtered = filter
     ? lines.filter(line => line.toLowerCase().includes(filter.toLowerCase()))
     : lines
@@ -398,6 +406,12 @@ export default function LogPage() {
           disabled={filtered.length === 0} style={{ gap: 4 }}>
           {copied ? <Check size={11} color="var(--green)" /> : <Copy size={11} />}
           {copied ? '복사됨' : '복사'}
+        </button>
+
+        <button className="btn btn-ghost btn-sm" onClick={downloadAll}
+          disabled={filtered.length === 0} style={{ gap: 4 }} title="로그 파일로 저장">
+          <Download size={11} />
+          저장
         </button>
 
         <button className="btn btn-ghost btn-sm" onClick={() => setLines([])}

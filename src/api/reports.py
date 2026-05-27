@@ -41,6 +41,31 @@ class ReportsMixin:
             return None
 
 
+    def save_text_file(self, content: str, filename: str = 'output.txt') -> dict:
+        """텍스트 내용을 사용자가 선택한 경로에 저장 (Save As 다이얼로그)."""
+        if not self._window:
+            return {'ok': False, 'error': 'window not available'}
+        try:
+            import webview
+            try:
+                dialog_type = webview.FileDialog.SAVE
+            except AttributeError:
+                dialog_type = webview.SAVE_DIALOG
+            result = self._window.create_file_dialog(
+                dialog_type,
+                save_filename=filename,
+                file_types=('Text files (*.txt *.log)', 'All files (*.*)'),
+            )
+            if not result:
+                return {'ok': False, 'error': 'cancelled'}
+            path = result[0] if isinstance(result, (list, tuple)) else result
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return {'ok': True, 'path': path}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
     def generate_report(self, cfg: dict):
         """하위 호환 — start_report 로 위임."""
         return self.start_report(cfg)

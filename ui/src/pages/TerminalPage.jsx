@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
-import { Terminal, Send, Trash2, ChevronRight } from 'lucide-react'
+import { Terminal, Send, Trash2, ChevronRight, Copy, Check } from 'lucide-react'
 
 const PROMPT = '$ kubectl '
 
@@ -39,6 +39,7 @@ export default function TerminalPage() {
   const [cmdHistory, setCmdHistory] = useState([])
   const [histIdx, setHistIdx]     = useState(-1)
   const [loading, setLoading]     = useState(false)
+  const [copied, setCopied]       = useState(false)
   const outputRef = useRef(null)
   const inputRef  = useRef(null)
 
@@ -68,6 +69,19 @@ export default function TerminalPage() {
       setHistory(prev => [...prev, { cmd, output: '', err: String(e) }])
     }
     setLoading(false)
+  }
+
+  async function copyAll() {
+    if (history.length === 0) return
+    const text = history.map(h => {
+      const parts = [`${PROMPT}${h.cmd}`]
+      if (h.output) parts.push(h.output)
+      if (h.err)    parts.push(h.err)
+      return parts.join('\n')
+    }).join('\n\n')
+    try { await navigator.clipboard.writeText(text) } catch {}
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
   }
 
   function handleKeyDown(e) {
@@ -110,6 +124,11 @@ export default function TerminalPage() {
             kubectl 터미널
           </span>
           <span style={{ flex: 1 }} />
+          <button className="btn btn-ghost btn-sm" onClick={copyAll}
+            disabled={history.length === 0} title="전체 출력 복사" style={{ gap: 4 }}>
+            {copied ? <Check size={12} color="var(--green)" /> : <Copy size={12} />}
+            {copied ? '복사됨' : '복사'}
+          </button>
           <button className="btn btn-ghost btn-sm" onClick={() => setHistory([])} title="출력 지우기">
             <Trash2 size={12} /> 지우기
           </button>
@@ -118,8 +137,14 @@ export default function TerminalPage() {
         {/* 출력 영역 */}
         <div
           ref={outputRef}
-          style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', fontFamily: 'var(--font-mono)' }}
-          onClick={() => inputRef.current?.focus()}
+          style={{
+            flex: 1, overflowY: 'auto', padding: '12px 16px',
+            fontFamily: 'var(--font-mono)', userSelect: 'text', cursor: 'text',
+          }}
+          onClick={() => {
+            const sel = window.getSelection()
+            if (!sel || sel.isCollapsed) inputRef.current?.focus()
+          }}
         >
           {history.length === 0 && (
             <div style={{ color: 'var(--text-dim)', fontSize: 12, lineHeight: 2 }}>

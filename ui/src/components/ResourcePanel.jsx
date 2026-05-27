@@ -19,7 +19,7 @@ function MonoBlock({ text, maxHeight = 480 }) {
   return (
     <div style={{ position: 'relative' }}>
       <button onClick={copy} style={{
-        position: 'absolute', top: 6, right: 6, zIndex: 1,
+        position: 'absolute', top: 6, right: 14, zIndex: 1,
         background: 'var(--bg-3)', border: '1px solid var(--border)',
         borderRadius: 4, padding: '2px 8px', cursor: 'pointer',
         fontSize: 10, color: 'var(--text-dim)',
