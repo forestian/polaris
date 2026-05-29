@@ -20,27 +20,17 @@ from src.k8s import K8sManager, _age, _parse_cpu, _parse_mem, _pct
 
 # DOCX 의존 — frozen build 에서 hiddenimports 로 끌어옴
 try:
-    from docx import Document
-    from docx.shared import Pt, Inches, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-try:
     from docx import Document as _DocxDoc
-    from docx.shared import Pt, RGBColor, Cm
+    from docx.shared import Pt, RGBColor, Cm, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn as _qn
     from docx.oxml import OxmlElement as _OxmlElem
     HAS_DOCX = True
 except ImportError:
     HAS_DOCX = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _report_required_dataset_keys() -> list[str]:
     return [
@@ -322,7 +312,6 @@ def _report_evaluate(data):
 
 def _llm_ask(url, model, user_prompt):
     """OpenAI 호환 API 단순 호출. max_tokens 생략 — 모델 기본값 사용."""
-    import urllib.request
     from urllib.parse import urlparse as _urlparse
 
     # ── URL 스킴 검증 (보안): file://, ftp:// 등 비HTTP 스킴 차단 ──────────────

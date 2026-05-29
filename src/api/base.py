@@ -147,8 +147,10 @@ class APIBase:
         self._session_save_blocked = True
 
 
-    def get_session(self):
-        """저장된 세션 상태 반환. 없거나 손상 시 None."""
+    def get_session(self) -> dict | None:
+        """저장된 세션 상태 반환. 없거나 손상 시 None.
+        Returns the saved session state. Returns None if it doesn't exist or is corrupted.
+        """
         try:
             if not self._SESSION_PATH.exists():
                 return None
@@ -162,8 +164,10 @@ class APIBase:
             return None
 
 
-    def save_session(self, state):
-        """세션 상태 저장. state는 JSON-직렬화 가능한 dict."""
+    def save_session(self, state: dict) -> dict:
+        """세션 상태 저장. state는 JSON-직렬화 가능한 dict.
+        Saves the session state. state must be a JSON-serializable dict.
+        """
         try:
             if getattr(self, '_session_save_blocked', False):
                 return {'ok': True, 'skipped': True}
@@ -296,10 +300,12 @@ class APIBase:
 
 
     def get_search_index(self, force: bool = False):
-        """활성 클러스터의 검색용 경량 리소스 인덱스 반환.
+        """활성 클러스터의 검색용 경량 리소스 인덱스 반환. (v3.13 병렬 수집)
         Returns: [{kind, rtype, name, namespace}]
         """
         import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
         mgr = self.k8s
         if not mgr.connected:
             return []
@@ -312,21 +318,27 @@ class APIBase:
         if not force and cached and (now - cached['t'] < 30):
             return cached['data']
 
-        idx = []
-        for rtype, kind in self._SEARCH_KINDS:
+        def fetch(item):
+            rtype, kind = item
             try:
-                items = mgr.get_resources(rtype, None) or []
+                res = mgr.get_resources(rtype, None) or []
+                return [(kind, rtype, r.get('name', ''), r.get('namespace', ''))
+                        for r in res if r.get('name')]
             except Exception:
-                continue
-            for item in items:
-                name = item.get('name', '')
-                if not name:
-                    continue
+                return []
+
+        idx = []
+        # I/O Bound 작업이므로 스레드 풀로 병렬 처리
+        with ThreadPoolExecutor(max_workers=len(self._SEARCH_KINDS)) as exe:
+            results = list(exe.map(fetch, self._SEARCH_KINDS))
+
+        for batch in results:
+            for kind, rtype, name, ns in batch:
                 idx.append({
                     'kind':      kind,
                     'rtype':     rtype,
                     'name':      name,
-                    'namespace': item.get('namespace', ''),
+                    'namespace': ns,
                 })
 
         self._search_cache[cache_key] = {'t': now, 'data': idx}

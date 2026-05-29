@@ -82,9 +82,10 @@ class ResourcesMixin:
         return result
 
 
-    def get_cluster_events(self, namespace: str = '', limit: int = 500, types=None):
+    def get_cluster_events(self, namespace: str = '', limit: int = 500, types: list[str] | None = None) -> dict:
         """
         클러스터 이벤트 목록 — 다중 fallback 전략 (v3.7.9).
+        List cluster events with multiple fallback strategies.
 
         Args:
             namespace: '' 이면 All Namespaces

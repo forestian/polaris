@@ -30,8 +30,10 @@ except ImportError:
 # 파싱 헬퍼
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _age(ts):
-    """kubernetes 객체의 creation_timestamp → 경과 시간 문자열."""
+def _age(ts: datetime) -> str:
+    """kubernetes 객체의 creation_timestamp → 경과 시간 문자열.
+    Converts a kubernetes creation_timestamp to a human-readable duration string.
+    """
     if not ts:
         return 'N/A'
     s = int((datetime.now(timezone.utc) - ts).total_seconds())
@@ -41,8 +43,10 @@ def _age(ts):
     return f'{s // 86400}d'
 
 
-def _parse_cpu(s):
-    """metrics.k8s.io CPU 값 ('123n', '45m', '0.1') → millicore (int)."""
+def _parse_cpu(s: str) -> int:
+    """metrics.k8s.io CPU 값 ('123n', '45m', '0.1') → millicore (int).
+    Parses metrics.k8s.io CPU values to millicores.
+    """
     if not s:
         return 0
     try:
@@ -54,8 +58,10 @@ def _parse_cpu(s):
         return 0
 
 
-def _parse_mem(s):
-    """memory 값 ('123Ki', '456Mi', '789') → bytes (int)."""
+def _parse_mem(s: str) -> int:
+    """memory 값 ('123Ki', '456Mi', '789') → bytes (int).
+    Parses memory strings (e.g., '128Mi') to bytes.
+    """
     if not s:
         return 0
     try:
@@ -549,7 +555,8 @@ class K8sManager:
 
     # ── 연결 ─────────────────────────────────────────────────────────────────
 
-    def connect(self, path: str, context: str = None):
+    def connect(self, path: str, context: str = None) -> tuple[bool, str]:
+        """클러스터에 연결합니다. (Connect to the cluster)"""
         if not HAS_K8S:
             return False, 'pip install kubernetes 후 재시작하세요.'
 
