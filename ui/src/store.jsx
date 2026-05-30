@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react'
 import { api } from './api.js'
 import { applyTheme, normalizeThemeId } from './themeRegistry.js'
+import { normalizeEnabledFeaturesResponse } from './featureGate.js'
 
 const AppContext = createContext(null)
 
@@ -31,6 +32,86 @@ export function AppProvider({ children }) {
   const [logTarget,  setLogTarget]    = useState(null)
   const [terminalCommand, setTerminalCommand] = useState('')
 
+  // ── 앱 모드 (v1.1.0) — 'k8s' | 'ssh' ──────────────────────────────────
+  // 모드 전환 시 사이드바 / 상단 탭 / 페이지 라우팅 모두 교체됨.
+  const [appMode, _setAppMode] = useState('k8s')
+  // SSH 모드 상태
+  const [sshActivePage, setSshActivePage] = useState('servers')   // servers|install|terminal
+
+  // ── Vault (v1.2.1 — 코어 보안) ────────────────────────────────────────────
+  // available: cryptography 사용 가능 여부 (false 면 게이트 우회 = 평문 동작)
+  // exists/unlocked: vault 파일 존재 / 현재 잠금 해제 상태
+  const [vaultStatus, setVaultStatus] = useState({ exists: false, unlocked: false, available: true, has_dpapi: false })
+  const [vaultChecked, setVaultChecked] = useState(false)   // 최초 부팅 시퀀스(자동해제 포함) 완료 여부
+  const [showVaultPanel, setShowVaultPanel] = useState(false) // 좌하단 박스 클릭 시 보안 보관함 패널
+
+  // vault 잠금 해제 간주 조건: 실제 unlock 됐거나 vault 가 비활성(평문 빌드)일 때
+  const vaultUnlocked = vaultStatus.unlocked === true || vaultStatus.available === false
+
+  // 상태만 갱신(부팅 완료 플래그는 건드리지 않음). 갱신된 상태 객체를 반환.
+  const refreshVaultStatus = useCallback(async () => {
+    let next
+    try {
+      const s = await api.vaultStatus()
+      if (s && s.error === undefined && typeof s.exists === 'boolean') {
+        next = {
+          exists:    !!s.exists,
+          unlocked:  !!s.unlocked,
+          available: s.available !== false,
+          has_dpapi: !!s.has_dpapi,
+        }
+      } else {
+        // 백엔드 미준비 / cryptography 없음 → 게이트 우회 (평문 동작)
+        next = { exists: false, unlocked: false, available: false, has_dpapi: false }
+      }
+    } catch {
+      next = { exists: false, unlocked: false, available: false, has_dpapi: false }
+    }
+    setVaultStatus(next)
+    return next
+  }, [])
+
+  // ── Vault 액션 (init / unlock / lock / 비번 변경 / 자동해제 토글) ─────────
+  const vaultInit = useCallback(async (pw, autoUnlock = false) => {
+    const r = await api.vaultInit(pw, autoUnlock)
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const vaultUnlock = useCallback(async (pw) => {
+    const r = await api.vaultUnlock(pw)
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const vaultUnlockDpapi = useCallback(async () => {
+    const r = await api.vaultUnlockDpapi()
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const vaultLock = useCallback(async () => {
+    const r = await api.vaultLock()
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const vaultChangePassword = useCallback(async (oldPw, newPw) => {
+    const r = await api.vaultChangePassword(oldPw, newPw)
+    return r
+  }, [])
+
+  const vaultSetAutoUnlock = useCallback(async (enable) => {
+    const r = await api.vaultSetAutoUnlock(enable)
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const setAppMode = useCallback((mode) => {
+    if (mode !== 'k8s' && mode !== 'ssh') return
+    _setAppMode(mode)
+  }, [])
+
   // ── 윈도우 가시성 (v3.7.11) ──────────────────────────────────────────────
   // 트레이로 hide되면 false → 모든 polling 일시정지
   const [windowVisible, setWindowVisible] = useState(true)
@@ -47,20 +128,90 @@ export function AppProvider({ children }) {
   const restoredRef = useRef(false)
   const saveTimerRef = useRef(null)
 
-  // ── 앱 버전 로드 ─────────────────────────────────────────────────────────
+  // 활성 옵셔널 플러그인 목록 (v1.1.0) — UI 게이팅용
+  const [enabledFeatures, setEnabledFeatures] = useState(null)
+
+  // ── 앱 버전 + features 로드 ─────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false
+    let retryTimer = null
+
+    function loadFeatures(attempt = 0) {
+      api.getEnabledFeatures()
+        .then(r => {
+          if (cancelled) return
+          const features = normalizeEnabledFeaturesResponse(r)
+          if (features !== null) {
+            setEnabledFeatures(features)
+            return
+          }
+          if (attempt < 20) {
+            retryTimer = window.setTimeout(() => loadFeatures(attempt + 1), 250)
+          }
+        })
+        .catch(() => {
+          if (!cancelled && attempt < 20) {
+            retryTimer = window.setTimeout(() => loadFeatures(attempt + 1), 250)
+          }
+        })
+    }
+
     function loadVersion() {
       api.getAppVersion()
         .then(r => setAppVersion(r?.version || ''))
         .catch(() => {})
+      loadFeatures()
     }
     if (window.pywebview?.api) {
       loadVersion()
     } else {
       window.addEventListener('pywebviewready', loadVersion, { once: true })
-      return () => window.removeEventListener('pywebviewready', loadVersion)
+    }
+
+    return () => {
+      cancelled = true
+      if (retryTimer) window.clearTimeout(retryTimer)
+      window.removeEventListener('pywebviewready', loadVersion)
     }
   }, [])
+
+  // ── Vault 부팅 시퀀스 (v1.2.1~) ──────────────────────────────────────────
+  // pywebview 준비 후 vault_status 조회 → DPAPI 자동해제 모드면 비밀번호 없이
+  // 먼저 해제 시도 → 결과 확정 후 vaultChecked=true (게이트 깜빡임 방지).
+  // dev 브라우저(pywebview 없음)는 2초 후 우회.
+  useEffect(() => {
+    let cancelled = false
+    let fallback = null
+    async function boot() {
+      if (cancelled) return
+      const s = await refreshVaultStatus()
+      // 자동 잠금 해제(DPAPI) 모드 + 아직 잠김 → 비밀번호 없이 해제 시도
+      if (!cancelled && s.available && s.exists && s.has_dpapi && !s.unlocked) {
+        try {
+          const r = await api.vaultUnlockDpapi()
+          if (!cancelled && r?.ok) await refreshVaultStatus()
+        } catch {}
+      }
+      if (!cancelled) setVaultChecked(true)
+    }
+    if (window.pywebview?.api) {
+      boot()
+    } else {
+      window.addEventListener('pywebviewready', boot, { once: true })
+      // dev 폴백: pywebview 가 끝내 안 뜨면 게이트 통과 (평문)
+      fallback = window.setTimeout(() => {
+        if (!cancelled && !window.pywebview?.api) {
+          setVaultStatus({ exists: false, unlocked: false, available: false, has_dpapi: false })
+          setVaultChecked(true)
+        }
+      }, 2000)
+    }
+    return () => {
+      cancelled = true
+      if (fallback) window.clearTimeout(fallback)
+      window.removeEventListener('pywebviewready', boot)
+    }
+  }, [refreshVaultStatus])
 
   // ── 윈도우 가시성 이벤트 리스너 (v3.7.11) ───────────────────────────────
   // 백엔드 _notify_visibility가 발행하는 'polaris:visibility' 커스텀 이벤트 구독
@@ -180,6 +331,20 @@ export function AppProvider({ children }) {
     return result
   }, [refreshClusters])
 
+  // ── vault 보관 kubeconfig 로 연결 (보안 보관함 패널에서, v1.2.1) ───────────
+  const connectFromVault = useCallback(async (kcName, context = null) => {
+    const result = await api.addClusterFromVault(kcName, context)
+    if (result?.ok) {
+      _setAppMode('k8s')
+      await refreshClusters()
+      if (result.cluster_id) setActiveClusterId(result.cluster_id)
+      setActivePage('dashboard')
+      _setNamespace('All Namespaces')
+      setClusterSwitchKey(k => k + 1)
+    }
+    return result
+  }, [refreshClusters])
+
   // ── 클러스터 제거 ─────────────────────────────────────────────────────────
   const removeCluster = useCallback(async (id) => {
     const result = await api.removeCluster(id)
@@ -240,6 +405,7 @@ export function AppProvider({ children }) {
         clusters: clusters.map(c => ({
           path:          c.path,
           context:       c.context       ?? null,
+          kc_name:       c.kc_name       ?? null,   // vault 보관 키 (v1.2.1)
           display_name:  c.display_name,
           lastPage:      c.lastPage      ?? 'dashboard',
           lastNamespace: c.lastNamespace ?? 'All Namespaces',
@@ -247,6 +413,7 @@ export function AppProvider({ children }) {
         })),
         activePath:    activeCl?.path    ?? null,
         activeContext: activeCl?.context ?? null,
+        activeKcName:  activeCl?.kc_name ?? null,
       }
       api.saveSession(state).catch(() => {})
     }, 500)
@@ -288,16 +455,25 @@ export function AppProvider({ children }) {
         if (!saved || saved.ok === false || !Array.isArray(saved.clusters) || saved.clusters.length === 0) {
           return
         }
-        // 저장된 path+context를 순차적으로 재연결 (실패는 조용히 skip)
-        // 동일 파일의 여러 context를 구분하기 위해 복합 키 사용
+        // 저장된 클러스터를 순차적으로 재연결 (실패는 조용히 skip).
+        // v1.2.1: kc_name 이 있으면 vault 내용으로 우선 복원(파일 불필요),
+        // 실패하거나 kc_name 이 없으면 원본 파일 경로로 fallback.
+        // 동일 파일/키의 여러 context 를 구분하기 위해 복합 키 사용.
+        const ckey = (s) => (s.kc_name ? 'kc:' + s.kc_name : 'path:' + (s.path || '')) + '::' + (s.context || '')
         const cidByKey = {}
         for (const sc of saved.clusters) {
-          if (!sc.path) continue
+          const hasVault = !!sc.kc_name
+          if (!hasVault && !sc.path) continue
           try {
-            const r = await api.addCluster(sc.path, sc.context ?? null)
+            let r = null
+            if (hasVault) {
+              r = await api.addClusterFromVault(sc.kc_name, sc.context ?? null)
+            }
+            if ((!r || !r.ok) && sc.path) {
+              r = await api.addCluster(sc.path, sc.context ?? null)
+            }
             if (r?.ok && r.cluster_id) {
-              const key = sc.path + '::' + (sc.context || '')
-              cidByKey[key] = r.cluster_id
+              cidByKey[ckey(sc)] = r.cluster_id
             }
           } catch {}
         }
@@ -306,10 +482,7 @@ export function AppProvider({ children }) {
         if (!Array.isArray(list) || list.length === 0) return
         // 저장 metadata 병합
         const merged = list.map(c => {
-          const sc = saved.clusters.find(s => {
-            const key = s.path + '::' + (s.context || '')
-            return cidByKey[key] === c.id
-          })
+          const sc = saved.clusters.find(s => cidByKey[ckey(s)] === c.id)
           return {
             ...c,
             lastPage:      sc?.lastPage      ?? 'dashboard',
@@ -320,25 +493,20 @@ export function AppProvider({ children }) {
         setClusters(merged)
         // 사용자 지정 이름이 있던 클러스터는 백엔드에 rename 호출
         for (const c of merged) {
-          const sc = saved.clusters.find(s => {
-            const key = s.path + '::' + (s.context || '')
-            return cidByKey[key] === c.id
-          })
+          const sc = saved.clusters.find(s => cidByKey[ckey(s)] === c.id)
           if (sc?.display_name && sc.display_name !== c.display_name) {
             try { await api.renameCluster(c.id, sc.display_name) } catch {}
           }
         }
-        // 활성 클러스터 결정 (저장된 activePath + activeContext → 첫 클러스터)
+        // 활성 클러스터 결정 (저장된 active 키 → 첫 클러스터)
         const activeMatch =
           merged.find(c => {
-            const sc = saved.clusters.find(s => {
-              const key = s.path + '::' + (s.context || '')
-              return cidByKey[key] === c.id
-            })
-            return sc
-              && saved.activePath
-              && sc.path === saved.activePath
-              && (sc.context || '') === (saved.activeContext || '')
+            const sc = saved.clusters.find(s => cidByKey[ckey(s)] === c.id)
+            if (!sc) return false
+            if (saved.activeKcName) return sc.kc_name === saved.activeKcName
+            if (saved.activePath)   return sc.path === saved.activePath
+                                          && (sc.context || '') === (saved.activeContext || '')
+            return false
           }) || merged[0]
         if (activeMatch) {
           try { await api.switchCluster(activeMatch.id) } catch {}
@@ -356,6 +524,10 @@ export function AppProvider({ children }) {
         restoredRef.current = true
       }
     }
+    // v1.2.1: vault 잠금 해제 전에는 복원을 미룬다 (kubeconfig 가 vault 에 있을 수
+    // 있으므로). vaultUnlocked 가 true 가 되는 순간 1회만 실행 (restoredRef 가드).
+    if (!vaultUnlocked) return
+    if (restoredRef.current) return
     if (window.pywebview?.api) {
       loadSettingsThenRestore()
     } else {
@@ -363,13 +535,13 @@ export function AppProvider({ children }) {
       window.addEventListener('pywebviewready', handler, { once: true })
       return () => window.removeEventListener('pywebviewready', handler)
     }
-  }, [refreshClusters])
+  }, [refreshClusters, vaultUnlocked])
 
   return (
     <AppContext.Provider value={{
       // 멀티클러스터
       clusters, activeClusterId, clusterSwitchKey,
-      addCluster, removeCluster, switchCluster, renameCluster,
+      addCluster, connectFromVault, removeCluster, switchCluster, renameCluster,
       refreshClusters,
 
       // 기존 호환 파생 상태
@@ -390,6 +562,17 @@ export function AppProvider({ children }) {
       // 가시성 & 설정 (v3.7.11)
       windowVisible,
       settings, saveSettings,
+
+      // 앱 모드 (v1.1.0)
+      appMode, setAppMode,
+      sshActivePage, setSshActivePage,
+      enabledFeatures,
+
+      // Vault (v1.2.1~)
+      vaultStatus, vaultChecked, vaultUnlocked, refreshVaultStatus,
+      vaultInit, vaultUnlock, vaultUnlockDpapi, vaultLock,
+      vaultChangePassword, vaultSetAutoUnlock,
+      showVaultPanel, setShowVaultPanel,
     }}>
       {children}
     </AppContext.Provider>

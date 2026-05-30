@@ -27,10 +27,6 @@ config
 !catalog/**/*.yaml
 !catalog/**/*.yml
 
-# GitHub Actions 워크플로우는 트래킹 대상 (예외)
-!.github/**/*.yml
-!.github/**/*.yaml
-
 # Claude Code 세션 데이터
 .claude/
 
@@ -50,6 +46,9 @@ desktop.ini
 # 압축 파일 (k9s 등 배포 바이너리)
 *.tar.gz
 *.zip
+
+# 로컬 유틸리티 스크립트 (트래킹 불필요)
+scripts/clear_icon_cache.bat
 
 # Python 가상환경
 venv/

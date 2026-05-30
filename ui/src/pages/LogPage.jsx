@@ -409,9 +409,9 @@ export default function LogPage() {
         </button>
 
         <button className="btn btn-ghost btn-sm" onClick={downloadAll}
-          disabled={filtered.length === 0} style={{ gap: 4 }} title="로그 파일로 저장">
+          disabled={filtered.length === 0} style={{ gap: 4 }} title="로그를 파일로 저장">
           <Download size={11} />
-          저장
+          다운로드
         </button>
 
         <button className="btn btn-ghost btn-sm" onClick={() => setLines([])}

@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VERSION = '1.0.13-e1'   # build.py 정규식 호환 — 무료 빌드 (카탈로그 plugin 제외)
+VERSION = '1.2.2-f1'   # 무료 변형 빌드 (SSH/infra + 앱 카탈로그 제외)
 
 # ── 하위 호환 re-export (테스트 + 외부 스크립트가 polaris.X 로 접근 가능) ────
 from src.tools import (
@@ -37,7 +37,7 @@ from src.tools import (
     _find_windows_terminal, _find_wt_settings, _inject_wt_polaris_scheme,
     _WT_SCHEME_NAME, _WT_POLARIS_SCHEME,
     _build_k9s_launch_command, _build_pod_shell_command,
-    _run_kubectl, _parse_kubectl_command, _extract_host_port,
+    _run_kubectl, _strip_versioner_noise, _parse_kubectl_command, _extract_host_port,
     _kubectl_subcommand_index, _is_kubectl_streaming_args,
 )
 from src.k8s import (
@@ -52,9 +52,11 @@ from src.k8s import (
     _clean_argo_sources, _argo_sources_from_spec, _argo_primary_source,
     _build_argocd_spec, _build_argocd_sync_operation,
     _resource_event_field_selector,
+    _normalize_kubectl_kind, _build_scale_args, _build_rollout_restart_args,
     _RFC1123_DNS_LABEL, _RFC1123_DNS_SUBDOMAIN,
     _LOG_SOURCE_ALIASES, _WORKLOAD_LOG_TYPES,
     _PORT_FORWARD_KIND_ALIASES, _RESOURCE_EVENT_KIND_MAP,
+    _KUBECTL_KIND_ALIASES, _SCALABLE_KINDS, _RESTARTABLE_KINDS,
     _DESCRIBE_SENSITIVE,
 )
 if HAS_K8S:
@@ -76,7 +78,7 @@ from src.topology import (
 from src._state import (
     _report_jobs, _log_jobs, _port_forward_jobs,
 )
-from src.api import PolarisAPI, ENABLED_FEATURES, HAS_CATALOG
+from src.api import PolarisAPI, ENABLED_FEATURES, HAS_CATALOG, OPTIONAL_PLUGIN_ERRORS
 
 # ── 옵셔널 plugin 의 helper / state re-export (있을 때만) ─────────────────────
 # variant 빌드에서 plugin 이 빠지면 try/except 가 조용히 건너뜀.
@@ -108,16 +110,42 @@ def _selfcheck() -> int:
 
     사용:  polaris.exe --selfcheck
     출력:  버전 / frozen 여부 / 활성 옵셔널 plugin / 핵심 API 메서드 노출 여부.
+
+    옵셔널 plugin 자동 발견이 frozen 빌드에서 깨지는 회귀(v1.0.10)를
+    GUI 실행 없이 즉시 검증하기 위한 진단 플래그. variant 빌드(polaris-free)
+    에서는 enabled_features 가 비어 있는 것이 정상이다.
     """
     import json
+    infra_dependencies = {}
+    if 'infra' in ENABLED_FEATURES:
+        try:
+            from src.vault import HAS_CRYPTO
+            from src.infra.ssh import HAS_PARAMIKO
+            infra_dependencies = {
+                'cryptography': bool(HAS_CRYPTO),
+                'paramiko': bool(HAS_PARAMIKO),
+            }
+        except Exception as e:
+            infra_dependencies = {
+                'cryptography': False,
+                'paramiko': False,
+                'error': f'{type(e).__name__}: {e}',
+            }
     report = {
         'version':          VERSION,
         'frozen':           bool(getattr(sys, 'frozen', False)),
         'enabled_features': list(ENABLED_FEATURES),
         'api_methods': {
             name: hasattr(PolarisAPI, name)
-            for name in ('get_status', 'get_dashboard', 'get_catalog')
+            for name in (
+                'get_status', 'get_dashboard',
+                'get_catalog',
+                'vault_status', 'list_servers', 'start_ssh_session',
+                'get_ssh_session_snapshot',
+            )
         },
+        'infra_dependencies': infra_dependencies,
+        'optional_plugin_errors': OPTIONAL_PLUGIN_ERRORS,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

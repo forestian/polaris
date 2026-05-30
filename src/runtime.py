@@ -12,6 +12,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from src.paths import polaris_dir
+
 _LIFECYCLE_OPEN = 'open'
 _LIFECYCLE_QUIT = 'quit'
 _INSTANCE_HOST = '127.0.0.1'
@@ -59,7 +61,7 @@ def _make_tray_image():
 
 def _app_log_event(message):
     try:
-        log_dir = Path.home() / '.polaris' / 'logs'
+        log_dir = polaris_dir() / 'logs'
         log_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with (log_dir / 'app.log').open('a', encoding='utf-8') as f:

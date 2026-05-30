@@ -6,6 +6,7 @@
 이 모듈은 kubernetes Python 라이브러리에 의존하지 않습니다 — 순수 subprocess 계층.
 """
 import os
+import re
 import sys
 import json
 import shlex
@@ -232,17 +233,55 @@ def _build_pod_shell_command(kubectl: str, exec_args: list[str], kubeconfig: str
 # kubectl 실행 + 명령어 파싱
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_kubectl(kubeconfig: str, args: list, timeout: int = 30):
-    """kubectl 명령 실행. (stdout, stderr) 반환."""
+# RKE2/Rancher 의 kubectl wrapper(versioner.go) 가 클러스터 버전에 맞는 kubectl 을
+# 처음 호출할 때 출력에 섞는 다운로드 진행 로그 패턴. 실제 명령 출력이 아니므로 제거한다.
+_VERSIONER_NOISE_RE = re.compile(
+    r'''(?xim)
+    ^.*(?:
+        versioner\.go:\d+          |  # I0529 ... versioner.go:115] ...
+        Right\ kubectl\ missing    |
+        Downloading\b              |
+        ^\s*kubectl[\w.+-]*\.exe\s+\d+%   # kubectl1.32.13+rke2r1.exe 5% |...|
+    ).*$
+    '''
+)
+
+
+def _strip_versioner_noise(text: str) -> str:
+    """kubectl wrapper(versioner) 의 다운로드 진행 로그 라인을 제거.
+
+    versioner 는 진행률을 carriage-return(\\r) 으로 갱신하기도 하므로 \\r 분해 후
+    노이즈 라인을 걸러낸다. 일반 kubectl 출력에는 영향 없음.
+    """
+    if not text or ('versioner' not in text and 'Downloading' not in text
+                    and '.exe ' not in text):
+        return text
+    # \r 로 갱신되는 진행률 조각 제거
+    text = text.replace('\r', '\n')
+    kept = [ln for ln in text.split('\n') if not _VERSIONER_NOISE_RE.match(ln)]
+    # 노이즈 제거 후 앞쪽 빈 줄 정리
+    return '\n'.join(kept).lstrip('\n')
+
+
+def _run_kubectl(kubeconfig: str, args: list, timeout: int = 30,
+                 stdin_input: str | None = None):
+    """kubectl 명령 실행. (stdout, stderr) 반환.
+
+    stdin_input 이 주어지면 표준입력으로 전달한다 (예: `kubectl apply -f -`).
+    임시 파일을 디스크에 쓰지 않으므로 민감한 매니페스트도 안전하게 적용 가능.
+
+    RKE2/Rancher kubectl wrapper 의 버전 다운로드 진행 로그는 자동으로 제거된다.
+    """
     kubectl = _find_kubectl()
     if not kubectl:
         return '', 'kubectl을 찾을 수 없습니다.'
     cmd = [kubectl, '--kubeconfig', kubeconfig] + args
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
+                           input=stdin_input,
                            timeout=timeout, encoding='utf-8', errors='replace',
                            creationflags=_NO_WINDOW)
-        return r.stdout, r.stderr
+        return _strip_versioner_noise(r.stdout), _strip_versioner_noise(r.stderr)
     except subprocess.TimeoutExpired:
         return '', f'타임아웃 ({timeout}s)'
     except Exception as e:

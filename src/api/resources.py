@@ -2,7 +2,10 @@
 """
 from datetime import datetime, timezone, timedelta
 
-from src.k8s import _is_secret_kind, _argo_primary_source, _argo_sources_from_spec
+from src.k8s import (
+    _is_secret_kind, _argo_primary_source, _argo_sources_from_spec,
+    _build_scale_args, _build_rollout_restart_args,
+)
 from src.tools import _run_kubectl
 
 
@@ -14,6 +17,97 @@ class ResourcesMixin:
     def get_resource(self, rtype: str, ns: str = ''):
         rows = self.k8s.get_resources(rtype, ns or None)
         return self._clean(rows)
+
+
+    def get_crds(self):
+        """클러스터의 CRD 목록 (자동 발견). [{name, group, version, kind, plural, ...}]"""
+        if not self.k8s.connected:
+            return {'ok': False, 'error': '연결되지 않음', 'items': []}
+        try:
+            return {'ok': True, 'items': self.k8s.get_crds()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e), 'items': []}
+
+
+    def get_crd_objects(self, group: str, version: str, plural: str,
+                        namespaced: bool = True, ns: str = '',
+                        printer_columns: list = None):
+        """특정 CRD 의 커스텀 객체 목록. printer_columns 가 있으면 동적 컬럼 값 포함."""
+        if not self.k8s.connected:
+            return {'ok': False, 'error': '연결되지 않음', 'items': []}
+        try:
+            rows = self.k8s.get_crd_objects(group, version, plural,
+                                            bool(namespaced), ns or None,
+                                            printer_columns or [])
+            return {'ok': True, 'items': self._clean(rows)}
+        except Exception as e:
+            return {'ok': False, 'error': str(e), 'items': []}
+
+
+    # ── RBAC 분석 ────────────────────────────────────────────────────────────
+
+    def get_rbac(self, include_system: bool = False):
+        """RBAC 전체 데이터 (roles / bindings / serviceaccounts) 한 번에 반환.
+
+        + serviceAccount 별 '실제 권한' 역추적:
+          SA → 그 SA 를 subject 로 가진 binding → roleRef → role 의 rules
+        """
+        if not self.k8s.connected:
+            return {'ok': False, 'error': '연결되지 않음'}
+        try:
+            roles    = self.k8s.get_rbac_roles(include_system)
+            bindings = self.k8s.get_rbac_bindings(include_system)
+            sas      = self.k8s.get_service_accounts()
+
+            # role 빠른 조회용 인덱스: (kind, name, namespace) → role
+            role_idx = {}
+            for r in roles:
+                role_idx[(r['kind'], r['name'], r['namespace'])] = r
+
+            # SA 별 권한 역추적
+            sa_perms = {}   # (ns, name) → {'bindings':[...], 'rules':[...]}
+            for b in bindings:
+                rr = b['role_ref']
+                # roleRef 가 가리키는 role 찾기 (ClusterRole 은 namespace='')
+                role = (role_idx.get(('ClusterRole', rr['name'], ''))
+                        or role_idx.get(('Role', rr['name'], b['namespace'])))
+                for s in b['subjects']:
+                    if s['kind'] != 'ServiceAccount':
+                        continue
+                    key = (s['namespace'] or b['namespace'], s['name'])
+                    entry = sa_perms.setdefault(key, {'bindings': [], 'rules': []})
+                    entry['bindings'].append({
+                        'binding':   b['name'],
+                        'binding_kind': b['kind'],
+                        'role_kind': rr['kind'],
+                        'role':      rr['name'],
+                    })
+                    if role:
+                        entry['rules'].extend(role['rules'])
+
+            # SA 목록에 권한 요약 부착
+            for sa in sas:
+                key = (sa['namespace'], sa['name'])
+                p = sa_perms.get(key, {'bindings': [], 'rules': []})
+                sa['binding_count'] = len(p['bindings'])
+                sa['bindings']      = p['bindings']
+                sa['rules']         = p['rules']
+
+            return {
+                'ok': True,
+                'roles':    roles,
+                'bindings': bindings,
+                'service_accounts': sas,
+                'summary': {
+                    'cluster_roles':  sum(1 for r in roles if r['kind'] == 'ClusterRole'),
+                    'roles':          sum(1 for r in roles if r['kind'] == 'Role'),
+                    'cluster_role_bindings': sum(1 for b in bindings if b['kind'] == 'ClusterRoleBinding'),
+                    'role_bindings':  sum(1 for b in bindings if b['kind'] == 'RoleBinding'),
+                    'service_accounts': len(sas),
+                },
+            }
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
 
 
     @staticmethod
@@ -251,6 +345,81 @@ class ResourcesMixin:
             if err and 'deleted' not in (out + err).lower():
                 return {'ok': False, 'error': err.strip()}
             return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
+    # ── 리소스 쓰기 (YAML apply / scale / rollout restart) ───────────────────
+
+    def apply_resource_yaml(self, yaml_text: str, kind: str = '') -> dict:
+        """편집된 YAML 을 kubectl apply -f - (stdin) 로 적용.
+
+        보안: Secret 은 YAML 조회 시 data/stringData 가 '[REDACTED]' 로 마스킹되므로
+        그 YAML 을 그대로 apply 하면 실제 시크릿이 파괴된다. → Secret apply 차단.
+        """
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        text = (yaml_text or '').strip()
+        if not text:
+            return {'ok': False, 'error': '적용할 YAML 이 비어 있습니다.'}
+
+        # Secret 보호 — 마스킹된 YAML 적용 방지
+        if _is_secret_kind(kind) or 'kind: Secret' in text:
+            if '[REDACTED]' in text:
+                return {'ok': False,
+                        'error': 'Secret 은 보안상 편집·적용이 차단됩니다. '
+                                 '(YAML 조회 시 값이 마스킹되어 그대로 적용하면 데이터가 손상됩니다)'}
+            return {'ok': False,
+                    'error': 'Secret 리소스는 Polaris 에서 편집·적용을 지원하지 않습니다.'}
+
+        try:
+            out, err = _run_kubectl(
+                self.k8s.kubeconfig,
+                ['apply', '-f', '-'],
+                timeout=30,
+                stdin_input=text,
+            )
+            combined = (out + err)
+            # kubectl apply 성공 시 stdout 에 'created'/'configured'/'unchanged'
+            if any(w in combined.lower() for w in ('created', 'configured', 'unchanged')):
+                return {'ok': True, 'output': out.strip() or combined.strip()}
+            if err.strip():
+                return {'ok': False, 'error': err.strip()}
+            return {'ok': True, 'output': out.strip()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
+    def scale_resource(self, kind: str, ns: str, name: str, replicas) -> dict:
+        """kubectl scale — Deployment/StatefulSet/ReplicaSet 의 replicas 변경."""
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        try:
+            args = _build_scale_args(kind, ns, name, replicas)
+        except ValueError as e:
+            return {'ok': False, 'error': str(e)}
+        try:
+            out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
+            if err and 'scaled' not in (out + err).lower():
+                return {'ok': False, 'error': err.strip()}
+            return {'ok': True, 'output': (out or err).strip()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
+    def rollout_restart(self, kind: str, ns: str, name: str) -> dict:
+        """kubectl rollout restart — Deployment/StatefulSet/DaemonSet 재시작."""
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        try:
+            args = _build_rollout_restart_args(kind, ns, name)
+        except ValueError as e:
+            return {'ok': False, 'error': str(e)}
+        try:
+            out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
+            if err and 'restarted' not in (out + err).lower():
+                return {'ok': False, 'error': err.strip()}
+            return {'ok': True, 'output': (out or err).strip()}
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 

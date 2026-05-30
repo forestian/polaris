@@ -5,10 +5,13 @@ import StatusBar from './components/StatusBar.jsx'
 import ConnectionModal from './components/ConnectionModal.jsx'
 import CommandPalette from './components/CommandPalette.jsx'
 import SettingsModal  from './components/SettingsModal.jsx'
+import VaultGate      from './components/VaultGate.jsx'
+import VaultPanel     from './components/VaultPanel.jsx'
 import { AlertCircle, Settings } from 'lucide-react'
 import PolarisMark from './components/PolarisMark.jsx'
+import { isFeatureEnabled } from './featureGate.js'
 
-// 페이지 lazy 로드
+// K8s 모드 페이지 lazy 로드
 const Dashboard       = lazy(() => import('./pages/Dashboard.jsx'))
 const ResourceBrowser = lazy(() => import('./pages/ResourceBrowser.jsx'))
 const ArgoPage        = lazy(() => import('./pages/ArgoPage.jsx'))
@@ -20,6 +23,25 @@ const K9sPage         = lazy(() => import('./pages/K9sPage.jsx'))
 const LogPage         = lazy(() => import('./pages/LogPage.jsx'))
 const EventsPage      = lazy(() => import('./pages/EventsPage.jsx'))
 const PortForwardPage = lazy(() => import('./pages/PortForwardPage.jsx'))
+const CrdPage         = lazy(() => import('./pages/CrdPage.jsx'))
+const RbacPage        = lazy(() => import('./pages/RbacPage.jsx'))
+const SnapshotPage    = lazy(() => import('./pages/SnapshotPage.jsx'))
+
+// ── catalog 플러그인 조건부 로드 (v1.2.2~) ────────────────────────────────────
+// infra 와 동일 패턴: 파일이 있으면 glob 이 로더를 반환, 무료빌드처럼 삭제되면
+// 빈 객체 → CatalogPage=null 로 자동 제외(정적 import 였다면 빌드가 깨짐).
+const _catalogGlob = import.meta.glob('./pages/CatalogPage.jsx', { eager: false })
+const _catalogLoader = _catalogGlob['./pages/CatalogPage.jsx']
+const CATALOG_BUNDLED = !!_catalogLoader
+const CatalogPage = _catalogLoader ? lazy(_catalogLoader) : null
+
+// ── infra 플러그인 조건부 로드 ────────────────────────────────────────────────
+// ui/src/infra/ 폴더가 빌드 시점에 존재하면 자동 등록. 무료빌드처럼 폴더
+// 삭제된 상태로 빌드하면 Vite 가 chunk 자체를 만들지 않음 (용량 증가 0).
+// 런타임 게이팅은 useApp().enabledFeatures.includes('infra') 로 추가 확인.
+const _infraGlob = import.meta.glob('./infra/index.jsx', { eager: false })
+const _infraLoader = _infraGlob['./infra/index.jsx']
+const INFRA_BUNDLED = !!_infraLoader
 
 // ── 클러스터 탭 단일 항목 ─────────────────────────────────────────────────────
 function ClusterTab({ cluster, active, editing, editName, onSwitch, onRemove, onStartEdit, onEditChange, onEditCommit, onEditCancel }) {
@@ -159,12 +181,14 @@ function ClusterTabStrip() {
 }
 
 // ── 타이틀바 ──────────────────────────────────────────────────────────────────
-function Titlebar({ onOpenPalette }) {
+function Titlebar({ onOpenPalette, infraComponents }) {
   const {
     appVersion, connected,
     namespace, setNamespace, namespaces, refreshStatus,
     setShowSettings,
+    appMode, enabledFeatures,
   } = useApp()
+  const infraEnabled = isFeatureEnabled('infra', enabledFeatures, INFRA_BUNDLED)
 
   return (
     <div style={{
@@ -187,7 +211,9 @@ function Titlebar({ onOpenPalette }) {
             letterSpacing: '-0.01em',
           }}>POLARIS</div>
           <div style={{ fontSize: 9, color: 'var(--text-dim)', marginTop: 2, letterSpacing: '0.1em' }}>
-            {appVersion ? `v${appVersion}` : ''} · NIMBUS NETWORKS
+            {/* 변형(무료 -f/-e) 빌드에서는 조직 브랜딩 숨김 */}
+            {appVersion ? `v${appVersion}` : ''}
+            {appVersion && !/-[ef]\d/.test(appVersion) ? ' · NIMBUS NETWORKS' : ''}
           </div>
         </div>
       </div>
@@ -218,13 +244,16 @@ function Titlebar({ onOpenPalette }) {
         }}>Ctrl+K</span>
       </button>
 
+      {/* 모드 스위처 (v1.1.0) — infra 플러그인 활성 시에만 표시 */}
+      {infraEnabled && infraComponents?.ModeSwitcher && <infraComponents.ModeSwitcher />}
+
       <div style={{ flex: 1 }} />
 
-      {/* 클러스터 탭 스트립 (v3.7.0) */}
-      <ClusterTabStrip />
+      {/* 클러스터 탭 스트립 — K8s 모드에서만 */}
+      {appMode === 'k8s' && <ClusterTabStrip />}
 
-      {/* 네임스페이스 셀렉터 */}
-      {connected && namespaces.length > 0 && (
+      {/* 네임스페이스 셀렉터 — K8s 모드에서만 */}
+      {appMode === 'k8s' && connected && namespaces.length > 0 && (
         <select
           className="select"
           value={namespace}
@@ -289,8 +318,8 @@ function PlaceholderPage({ icon: Icon, title, sub }) {
   )
 }
 
-// ── 페이지 뷰 (클러스터 전환 시 key로 강제 재마운트) ─────────────────────────
-function PageView() {
+// ── K8s 모드 페이지 뷰 ───────────────────────────────────────────────────────
+function K8sPageView() {
   const { activePage, connected } = useApp()
 
   switch (activePage) {
@@ -311,26 +340,58 @@ function PageView() {
     case 'events':     return connected ? <EventsPage /> : (
       <PlaceholderPage icon={AlertCircle} title="클러스터에 연결되지 않았습니다." />
     )
+    case 'catalog':    return CatalogPage
+      ? <CatalogPage />
+      : <PlaceholderPage icon={AlertCircle} title="앱 카탈로그는 이 빌드에 포함되지 않았습니다." />
+    case 'crds':       return connected ? <CrdPage /> : (
+      <PlaceholderPage icon={AlertCircle} title="클러스터에 연결되지 않았습니다." />
+    )
+    case 'rbac':       return connected ? <RbacPage /> : (
+      <PlaceholderPage icon={AlertCircle} title="클러스터에 연결되지 않았습니다." />
+    )
+    case 'snapshots':  return <SnapshotPage />
     default:           return <Dashboard />
   }
 }
 
-// ── 메인 콘텐츠 ───────────────────────────────────────────────────────────────
-// clusterSwitchKey가 바뀔 때마다 PageView를 완전 재마운트 → 데이터 자동 새로고침
-function MainContent() {
-  const { clusterSwitchKey } = useApp()
+// ── SSH 모드 페이지 뷰 (v1.1.0) — infra 컴포넌트 동적 로드 ────────────────────
+function SSHPageView({ infraComponents }) {
+  const { sshActivePage } = useApp()
+  if (!infraComponents) return <PageLoading />
+  const { ServersPage, InstallPage, SSHTerminalPage } = infraComponents
+  switch (sshActivePage) {
+    case 'servers':  return <ServersPage />
+    case 'install':  return <InstallPage />
+    case 'terminal': return <SSHTerminalPage />
+    default:         return <ServersPage />
+  }
+}
 
+// ── 메인 콘텐츠 — 모드에 따라 분기 ────────────────────────────────────────────
+// K8s 모드: clusterSwitchKey 가 바뀌면 페이지 강제 재마운트
+function MainContent({ infraComponents }) {
+  const { appMode, clusterSwitchKey, enabledFeatures } = useApp()
+  const infraEnabled = isFeatureEnabled('infra', enabledFeatures, INFRA_BUNDLED)
   return (
     <Suspense fallback={<PageLoading />}>
-      <PageView key={clusterSwitchKey} />
+      {appMode === 'ssh' && infraEnabled
+        ? <SSHPageView infraComponents={infraComponents} />
+        : <K8sPageView key={clusterSwitchKey} />}
     </Suspense>
   )
 }
 
 // ── 앱 레이아웃 ────────────────────────────────────────────────────────────────
 function AppLayout() {
-  const { showConnect, showSettings } = useApp()
+  const { showConnect, showSettings, appMode, enabledFeatures } = useApp()
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [infraComponents, setInfraComponents] = useState(null)
+
+  // infra 모듈 비동기 로드 — 폴더 있을 때만
+  useEffect(() => {
+    if (!INFRA_BUNDLED) return
+    _infraLoader().then(setInfraComponents).catch(() => setInfraComponents(null))
+  }, [])
 
   // ⌘K / Ctrl+K 글로벌 단축키 — 어디서든 명령 팔레트 토글
   useEffect(() => {
@@ -345,6 +406,8 @@ function AppLayout() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const infraEnabled = isFeatureEnabled('infra', enabledFeatures, INFRA_BUNDLED)
+
   return (
     <div style={{
       display: 'flex', flexDirection: 'column',
@@ -352,13 +415,16 @@ function AppLayout() {
       background: 'var(--bg-0)',
     }}>
       {/* 타이틀바 */}
-      <Titlebar onOpenPalette={() => setPaletteOpen(true)} />
+      <Titlebar onOpenPalette={() => setPaletteOpen(true)}
+                infraComponents={infraComponents} />
 
-      {/* 사이드바 + 콘텐츠 */}
+      {/* 사이드바 + 콘텐츠 — 모드에 따라 사이드바 교체 */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        <Sidebar />
+        {appMode === 'ssh' && infraEnabled && infraComponents?.SSHSidebar
+          ? <infraComponents.SSHSidebar />
+          : <Sidebar />}
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          <MainContent />
+          <MainContent infraComponents={infraComponents} />
         </main>
       </div>
 
@@ -371,6 +437,9 @@ function AppLayout() {
       {/* 설정 모달 (v3.7.11) */}
       {showSettings && <SettingsModal />}
 
+      {/* 보안 보관함 패널 (v1.2.1) — 좌하단 박스 클릭 시, K8s/SSH 공통 */}
+      <VaultPanel />
+
       {/* 명령 팔레트 (⌘K) */}
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
@@ -381,7 +450,9 @@ function AppLayout() {
 export default function App() {
   return (
     <AppProvider>
-      <AppLayout />
+      <VaultGate>
+        <AppLayout />
+      </VaultGate>
     </AppProvider>
   )
 }

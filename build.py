@@ -20,6 +20,7 @@ import sys
 import shutil
 import subprocess
 import importlib.util
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +37,8 @@ REQUIRED_RUNTIME_IMPORTS = [
     ('PyInstaller', 'pyinstaller'),
     ('pystray', 'pystray'),
     ('PIL', 'Pillow'),
+    ('cryptography', 'cryptography'),
+    ('paramiko', 'paramiko'),
 ]
 
 
@@ -181,6 +184,24 @@ def _normalize_text_file(path):
     Path(path).write_text(text, encoding='utf-8', newline='\n')
 
 
+def _node_module_path(ui_dir, package_name):
+    return Path(ui_dir) / 'node_modules' / Path(*package_name.split('/'))
+
+
+def _missing_node_modules_dependencies(ui_dir):
+    package_file = Path(ui_dir) / 'package.json'
+    if not package_file.exists():
+        return []
+    pkg = json.loads(package_file.read_text(encoding='utf-8'))
+    deps = {}
+    deps.update(pkg.get('dependencies') or {})
+    deps.update(pkg.get('devDependencies') or {})
+    return [
+        name for name in sorted(deps)
+        if not _node_module_path(ui_dir, name).exists()
+    ]
+
+
 def run_npm_build():
     """React UI 빌드 (ui/dist 생성)."""
     ui_dir = ROOT / 'ui'
@@ -190,8 +211,11 @@ def run_npm_build():
     npm = _resolve_command_path(_resolve_npm_command())
     install_cmd = ['ci'] if (ui_dir / 'package-lock.json').exists() else ['install']
 
-    # node_modules 없으면 npm install 먼저
-    if not (ui_dir / 'node_modules').exists():
+    missing_deps = _missing_node_modules_dependencies(ui_dir)
+    # node_modules가 없거나 package.json의 직접 의존성이 누락되면 npm install 먼저
+    if not (ui_dir / 'node_modules').exists() or missing_deps:
+        if missing_deps:
+            info(f'누락된 npm 의존성 감지: {", ".join(missing_deps)}')
         info(f'{" ".join(npm + install_cmd)} 실행 중...')
         r = subprocess.run(npm + install_cmd, cwd=str(ui_dir))
         if r.returncode != 0:

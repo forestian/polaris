@@ -11,7 +11,9 @@
   - K8sManager 클래스: kubernetes 클라이언트 래퍼 (각 리소스 getter)
 """
 import re
+import os
 import json
+import tempfile
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +41,53 @@ def _age(ts):
     if s < 3600:  return f'{s // 60}m'
     if s < 86400: return f'{s // 3600}h'
     return f'{s // 86400}d'
+
+
+def _jsonpath_get(obj, path):
+    """CRD additionalPrinterColumns 의 단순 JSONPath(.a.b.c) 값 추출.
+
+    printer column 의 jsonPath 는 대부분 `.status.phase`, `.spec.replicas`,
+    `.metadata.creationTimestamp` 같은 단순 dot 경로. 배열 인덱스나 필터는
+    드물어 미지원(빈 문자열 반환). 값이 dict/list 면 빈 문자열.
+    """
+    if not path:
+        return ''
+    p = str(path).lstrip('.')
+    cur = obj
+    for part in p.split('.'):
+        if not part:
+            continue
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return ''
+    if cur is None:
+        return ''
+    if isinstance(cur, bool):
+        return 'true' if cur else 'false'
+    if isinstance(cur, (str, int, float)):
+        return str(cur)
+    return ''   # dict/list 등 복합 타입은 표시 생략
+
+
+def _parse_ts(value):
+    """ISO8601 타임스탬프 문자열(또는 datetime) → tz-aware datetime. 실패 시 None.
+
+    custom object(dict) 의 metadata.creationTimestamp 는 '2024-01-01T00:00:00Z'
+    같은 문자열이므로 _age() 에 넘기기 전에 변환한다.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        s = str(value).replace('Z', '+00:00')
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 def _parse_cpu(s):
@@ -535,6 +584,81 @@ def _resource_event_field_selector(kind: str, name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 리소스 쓰기 (scale / rollout restart) args 빌더 — 순수 함수, 단위 테스트 대상
+# ─────────────────────────────────────────────────────────────────────────────
+
+# UI 내부 리소스 키 → kubectl 정식 리소스 타입
+_KUBECTL_KIND_ALIASES = {
+    'pods': 'pods', 'pod': 'pods',
+    'deployments': 'deployments', 'deployment': 'deployments', 'deploy': 'deployments',
+    'statefulsets': 'statefulsets', 'statefulset': 'statefulsets', 'sts': 'statefulsets',
+    'daemonsets': 'daemonsets', 'daemonset': 'daemonsets', 'ds': 'daemonsets',
+    'replicasets': 'replicasets', 'replicaset': 'replicasets', 'rs': 'replicasets',
+    'services': 'services', 'service': 'services', 'svc': 'services',
+    'ingresses': 'ingresses', 'ingress': 'ingresses',
+    'configmaps': 'configmaps', 'configmap': 'configmaps', 'cm': 'configmaps',
+    'secrets': 'secrets', 'secret': 'secrets',
+    'jobs': 'jobs', 'job': 'jobs',
+    'cronjobs': 'cronjobs', 'cronjob': 'cronjobs', 'cj': 'cronjobs',
+    'pvcs': 'persistentvolumeclaims', 'pvc': 'persistentvolumeclaims',
+    'pvs': 'persistentvolumes', 'pv': 'persistentvolumes',
+    'namespaces': 'namespaces', 'namespace': 'namespaces', 'ns': 'namespaces',
+    'nodes': 'nodes', 'node': 'nodes',
+}
+
+# scale 가능한 리소스 (replicas 필드를 가진 워크로드)
+_SCALABLE_KINDS = {'deployments', 'statefulsets', 'replicasets'}
+
+# rollout restart 가능한 리소스
+_RESTARTABLE_KINDS = {'deployments', 'statefulsets', 'daemonsets'}
+
+
+def _normalize_kubectl_kind(kind: str) -> str:
+    """UI 키 → kubectl 정식 리소스 타입. 매핑 없으면 입력값 그대로 (소문자)."""
+    key = str(kind or '').strip().lower()
+    return _KUBECTL_KIND_ALIASES.get(key, key)
+
+
+def _build_scale_args(kind: str, ns: str, name: str, replicas) -> list[str]:
+    """kubectl scale args 빌더. 검증 실패 시 ValueError."""
+    k = _normalize_kubectl_kind(kind)
+    if k not in _SCALABLE_KINDS:
+        raise ValueError(f'scale 불가 리소스: {kind} (지원: deployment/statefulset/replicaset)')
+    name = str(name or '').strip()
+    if not name:
+        raise ValueError('리소스 이름이 필요합니다.')
+    if len(name) > 253 or not _RFC1123_DNS_SUBDOMAIN.match(name):
+        raise ValueError(f'잘못된 리소스 이름: {name!r}')
+    try:
+        r = int(replicas)
+    except Exception as exc:
+        raise ValueError('replicas 는 정수여야 합니다.') from exc
+    if r < 0 or r > 1000:
+        raise ValueError('replicas 는 0~1000 범위여야 합니다.')
+    ns = str(ns or '').strip()
+    if ns and (len(ns) > 63 or not _RFC1123_DNS_LABEL.match(ns)):
+        raise ValueError(f'잘못된 네임스페이스: {ns!r}')
+    return (['-n', ns] if ns else []) + ['scale', k, name, f'--replicas={r}']
+
+
+def _build_rollout_restart_args(kind: str, ns: str, name: str) -> list[str]:
+    """kubectl rollout restart args 빌더. 검증 실패 시 ValueError."""
+    k = _normalize_kubectl_kind(kind)
+    if k not in _RESTARTABLE_KINDS:
+        raise ValueError(f'restart 불가 리소스: {kind} (지원: deployment/statefulset/daemonset)')
+    name = str(name or '').strip()
+    if not name:
+        raise ValueError('리소스 이름이 필요합니다.')
+    if len(name) > 253 or not _RFC1123_DNS_SUBDOMAIN.match(name):
+        raise ValueError(f'잘못된 리소스 이름: {name!r}')
+    ns = str(ns or '').strip()
+    if ns and (len(ns) > 63 or not _RFC1123_DNS_LABEL.match(ns)):
+        raise ValueError(f'잘못된 네임스페이스: {ns!r}')
+    # kubectl rollout restart deployments/<name> 형태
+    return (['-n', ns] if ns else []) + ['rollout', 'restart', f'{k}/{name}']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # K8sManager — kubernetes Python 클라이언트 래퍼
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -544,20 +668,66 @@ class K8sManager:
         self.connected     = False
         self.cluster_info  = {}
         self._api_client   = None   # 인스턴스 전용 ApiClient (전역 config 분리)
+        self._temp_kubeconfig = None  # vault content 로 연결 시 세션 임시 파일
         self.core = self.apps = self.batch = self.net = None
         self.custom = self.autoscaling = self.storage = self.rbac = self.policy = None
 
+    # ── 임시 kubeconfig (vault content 복원용) ─────────────────────────────────
+    # kubectl 기반 기능(logs/port-forward/terminal 등)이 self.kubeconfig 파일
+    # 경로를 필요로 하므로, vault 에 보관된 내용으로 연결할 때는 세션 동안 유지되는
+    # 임시 파일을 만들고 disconnect 시 삭제한다.
+    def _write_temp_kubeconfig(self, content: str) -> str:
+        self._cleanup_temp_kubeconfig()
+        fd, tmp = tempfile.mkstemp(suffix='.yaml', prefix='polaris-kc-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
+        try:
+            os.chmod(tmp, 0o600)   # 소유자만 읽기 (best-effort)
+        except Exception:
+            pass
+        self._temp_kubeconfig = tmp
+        return tmp
+
+    def _cleanup_temp_kubeconfig(self):
+        tmp = getattr(self, '_temp_kubeconfig', None)
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            self._temp_kubeconfig = None
+
     # ── 연결 ─────────────────────────────────────────────────────────────────
 
-    def connect(self, path: str, context: str = None):
+    def connect(self, path: str = None, context: str = None, content: str = None):
         if not HAS_K8S:
             return False, 'pip install kubernetes 후 재시작하세요.'
 
+        # ── content 기반 연결 (vault 복원) — 세션 임시 파일 생성 ────────────────
+        used_temp = False
+        if content is not None:
+            try:
+                path = self._write_temp_kubeconfig(content)
+                used_temp = True
+            except Exception as e:
+                return False, f'kubeconfig 임시 파일 생성 실패: {e}'
+
         # ── 사전 검증 ──────────────────────────────────────────────────────────
-        p = Path(path)
-        if not p.is_file():
+        p = Path(path) if path else None
+        if not p or not p.is_file():
+            if used_temp:
+                self._cleanup_temp_kubeconfig()
             return False, f'kubeconfig 파일을 찾을 수 없습니다: {path}'
         if p.stat().st_size > 5 * 1024 * 1024:  # 5 MB 초과는 kubeconfig 아님
+            if used_temp:
+                self._cleanup_temp_kubeconfig()
             return False, 'kubeconfig 파일이 너무 큽니다 (5 MB 초과).'
 
         try:
@@ -597,12 +767,15 @@ class K8sManager:
             return True, f'연결 성공 — {ver.git_version}'
         except Exception as e:
             self.connected = False
+            if used_temp:
+                self._cleanup_temp_kubeconfig()
             return False, _diagnose_connect_error(e, path)
 
     def disconnect(self):
         self.connected = False
         self.kubeconfig = None
         self.cluster_info = {}
+        self._cleanup_temp_kubeconfig()
         # ApiClient 연결 풀 해제
         try:
             if self._api_client:
@@ -1135,6 +1308,96 @@ class K8sManager:
             pass
         return result
 
+    # ── CRD (CustomResourceDefinition) 자동 발견 ─────────────────────────────
+
+    def get_crds(self):
+        """클러스터의 모든 CRD 메타 목록.
+
+        반환: [{name, group, version(스토리지 버전), kind, plural, scoped, ...}]
+        custom API 로 apiextensions.k8s.io/v1/customresourcedefinitions 조회.
+        """
+        if not self.custom:
+            return []
+        try:
+            result = self.custom.list_cluster_custom_object(
+                group='apiextensions.k8s.io', version='v1',
+                plural='customresourcedefinitions',
+            )
+        except Exception:
+            return []
+        out = []
+        for item in result.get('items', []):
+            spec = item.get('spec', {})
+            md   = item.get('metadata', {})
+            names = spec.get('names', {})
+            versions = spec.get('versions', []) or []
+            # 스토리지/served 버전 선택 (storage=true 우선, 없으면 첫 served)
+            storage_v = next((v.get('name') for v in versions if v.get('storage')), '')
+            served    = [v.get('name') for v in versions if v.get('served')]
+            ver = storage_v or (served[0] if served else (versions[0].get('name') if versions else ''))
+            group = spec.get('group', '')
+            # 선택된 버전의 additionalPrinterColumns 추출 (없으면 [])
+            ver_obj = next((v for v in versions if v.get('name') == ver), {})
+            printer_cols = [
+                {'name': c.get('name', ''), 'jsonPath': c.get('jsonPath', '')}
+                for c in (ver_obj.get('additionalPrinterColumns', []) or [])
+                if c.get('name') and c.get('jsonPath')
+                and c.get('name', '').lower() != 'age'   # Age 는 우리가 따로 표시
+            ]
+            out.append({
+                'name':    md.get('name', ''),
+                'group':   group,
+                'version': ver,
+                'kind':    names.get('kind', ''),
+                'plural':  names.get('plural', ''),
+                'short':   ','.join(names.get('shortNames', []) or []),
+                'scope':   spec.get('scope', 'Namespaced'),
+                'namespaced': spec.get('scope', 'Namespaced') == 'Namespaced',
+                'versions': served,
+                'printer_columns': printer_cols[:5],   # 너무 많으면 5개로 제한
+                'age':     _age(_parse_ts(md.get('creationTimestamp'))),
+            })
+        out.sort(key=lambda x: (x['group'], x['kind']))
+        return out
+
+    def get_crd_objects(self, group: str, version: str, plural: str,
+                        namespaced: bool, ns: str = None,
+                        printer_columns: list = None):
+        """특정 CRD 의 커스텀 객체 목록 (generic 테이블용).
+
+        printer_columns: [{'name', 'jsonPath'}] — CRD 가 정의한 추가 컬럼.
+        각 객체에서 jsonPath 값을 추출해 'col_<name>' 키로 담는다.
+
+        반환: [{name, namespace, age, col_<...>, _ns, _kind}]
+        """
+        if not self.custom:
+            return []
+        try:
+            if namespaced and ns and not self._an(ns):
+                result = self.custom.list_namespaced_custom_object(
+                    group=group, version=version, namespace=ns, plural=plural)
+            else:
+                result = self.custom.list_cluster_custom_object(
+                    group=group, version=version, plural=plural)
+        except Exception:
+            return []
+        cols = printer_columns or []
+        rows = []
+        for item in result.get('items', []):
+            md = item.get('metadata', {})
+            row = {
+                'name':      md.get('name', ''),
+                'namespace': md.get('namespace', '') or '',
+                'age':       _age(_parse_ts(md.get('creationTimestamp'))),
+                '_ns':       md.get('namespace'),
+                '_kind':     f'{plural}.{group}',
+            }
+            for c in cols:
+                row[f'col_{c["name"]}'] = _jsonpath_get(item, c.get('jsonPath', ''))
+            rows.append(row)
+        return rows
+
+
     # ── ArgoCD ───────────────────────────────────────────────────────────────
 
     def get_argocd_apps(self):
@@ -1600,6 +1863,154 @@ class K8sManager:
             }
         except Exception:
             return {}
+
+    # ── RBAC 분석 뷰어 ───────────────────────────────────────────────────────
+
+    def get_rbac_roles(self, include_system: bool = False):
+        """Role + ClusterRole 목록 (규칙 포함).
+
+        반환: [{name, namespace('' if cluster), kind('Role'|'ClusterRole'),
+                rules:[{verbs, resources, apiGroups}], rule_count, age}]
+        """
+        if not self.rbac:
+            return []
+        out = []
+
+        def add(items, kind):
+            for r in items:
+                name = r.metadata.name
+                if not include_system and name.startswith('system:'):
+                    continue
+                rules = []
+                for rule in (r.rules or []):
+                    rules.append({
+                        'verbs':     list(rule.verbs or []),
+                        'resources': list(rule.resources or []),
+                        'apiGroups': list(rule.api_groups or []),
+                    })
+                out.append({
+                    'name':       name,
+                    'namespace':  getattr(r.metadata, 'namespace', '') or '',
+                    'kind':       kind,
+                    'rules':      rules,
+                    'rule_count': len(rules),
+                    'age':        _age(r.metadata.creation_timestamp),
+                })
+        try:
+            add(self.rbac.list_cluster_role().items, 'ClusterRole')
+            add(self.rbac.list_role_for_all_namespaces().items, 'Role')
+        except Exception:
+            pass
+        out.sort(key=lambda x: (x['kind'] != 'ClusterRole', x['name']))
+        return out
+
+    def get_rbac_bindings(self, include_system: bool = False):
+        """RoleBinding + ClusterRoleBinding 목록 (roleRef + subjects).
+
+        반환: [{name, namespace, kind, role_ref:{kind,name}, subjects:[{kind,name,namespace}], age}]
+        """
+        if not self.rbac:
+            return []
+        out = []
+
+        def add(items, kind):
+            for b in items:
+                name = b.metadata.name
+                if not include_system and name.startswith('system:'):
+                    continue
+                rr = b.role_ref
+                subs = []
+                for s in (b.subjects or []):
+                    subs.append({
+                        'kind':      getattr(s, 'kind', ''),
+                        'name':      getattr(s, 'name', ''),
+                        'namespace': getattr(s, 'namespace', '') or '',
+                    })
+                out.append({
+                    'name':      name,
+                    'namespace': getattr(b.metadata, 'namespace', '') or '',
+                    'kind':      kind,
+                    'role_ref':  {'kind': getattr(rr, 'kind', ''), 'name': getattr(rr, 'name', '')},
+                    'subjects':  subs,
+                    'age':       _age(b.metadata.creation_timestamp),
+                })
+        try:
+            add(self.rbac.list_cluster_role_binding().items, 'ClusterRoleBinding')
+            add(self.rbac.list_role_binding_for_all_namespaces().items, 'RoleBinding')
+        except Exception:
+            pass
+        out.sort(key=lambda x: (x['kind'] != 'ClusterRoleBinding', x['name']))
+        return out
+
+    def get_service_accounts(self):
+        """ServiceAccount 목록. 반환: [{name, namespace, secrets, age}]"""
+        if not self.core:
+            return []
+        try:
+            return [{
+                'name':      sa.metadata.name,
+                'namespace': sa.metadata.namespace,
+                'secrets':   len(sa.secrets or []),
+                'age':       _age(sa.metadata.creation_timestamp),
+            } for sa in self.core.list_service_account_for_all_namespaces().items]
+        except Exception:
+            return []
+
+    def get_rbac_risky_subjects(self, include_system: bool = False):
+        """과도한 권한(클러스터 관리자급) 보유 subject 목록 — 보고서 보안 점검용.
+
+        판정 기준:
+          • cluster-admin ClusterRole 에 바인딩된 subject
+          • 와일드카드 규칙(apiGroups=*, resources=*, verbs=*) 보유 role 에 바인딩된 subject
+
+        system: 접두 이름(빌드인 system:masters 등)은 기본 제외(노이즈 감소).
+        반환: [{subject_kind, name, namespace, role, role_kind,
+                binding, binding_kind, reason}]
+        """
+        try:
+            roles    = self.get_rbac_roles(include_system)
+            bindings = self.get_rbac_bindings(include_system)
+        except Exception:
+            return []
+
+        role_idx = {(r['kind'], r['name'], r['namespace']): r for r in roles}
+
+        def _is_wildcard(role):
+            for rule in (role.get('rules') or []):
+                ag  = rule.get('apiGroups') or []
+                res = rule.get('resources') or []
+                vb  = rule.get('verbs') or []
+                if '*' in ag and '*' in res and '*' in vb:
+                    return True
+            return False
+
+        risky = []
+        for b in bindings:
+            rr    = b.get('role_ref') or {}
+            rname = rr.get('name', '')
+            rkind = rr.get('kind', '')
+            is_admin = (rkind == 'ClusterRole' and rname == 'cluster-admin')
+            role = (role_idx.get(('ClusterRole', rname, ''))
+                    or role_idx.get(('Role', rname, b.get('namespace', ''))))
+            wild = bool(role and _is_wildcard(role))
+            if not (is_admin or wild):
+                continue
+            reason = 'cluster-admin 바인딩' if is_admin else '와일드카드 권한(*/*/*)'
+            for s in (b.get('subjects') or []):
+                sname = s.get('name', '')
+                if not include_system and sname.startswith('system:'):
+                    continue
+                risky.append({
+                    'subject_kind': s.get('kind', ''),
+                    'name':         sname,
+                    'namespace':    s.get('namespace', '') or b.get('namespace', '') or '-',
+                    'role':         rname,
+                    'role_kind':    rkind,
+                    'binding':      b.get('name', ''),
+                    'binding_kind': b.get('kind', ''),
+                    'reason':       reason,
+                })
+        return risky
 
     def get_kube_system_info(self):
         NS = 'kube-system'

@@ -41,27 +41,40 @@ class ReportsMixin:
             return None
 
 
-    def save_text_file(self, content: str, filename: str = 'output.txt') -> dict:
-        """텍스트 내용을 사용자가 선택한 경로에 저장 (Save As 다이얼로그)."""
+    def save_text_file(self, content: str, filename: str = 'polaris-export.txt') -> dict:
+        """텍스트 내용을 네이티브 SAVE 다이얼로그로 저장.
+
+        pywebview 환경에서 브라우저식 Blob 다운로드는 불안정하므로, 백엔드에서
+        저장 다이얼로그를 띄우고 직접 파일을 기록한다. 로그뷰어/이벤트 등
+        텍스트 export 공용 메서드.
+
+        반환: {ok:True, path} / {ok:False, canceled:True} / {ok:False, error}
+        """
         if not self._window:
-            return {'ok': False, 'error': 'window not available'}
+            return {'ok': False, 'error': '윈도우가 준비되지 않았습니다.'}
         try:
             import webview
             try:
                 dialog_type = webview.FileDialog.SAVE
             except AttributeError:
-                dialog_type = webview.SAVE_DIALOG
+                dialog_type = webview.SAVE_DIALOG  # < 6.x
+            ext = Path(filename).suffix.lower()
+            if ext in ('.csv', '.tsv'):
+                file_types = ('CSV/TSV (*.csv;*.tsv)', 'All files (*.*)')
+            elif ext == '.log':
+                file_types = ('로그 파일 (*.log)', 'Text 파일 (*.txt)', 'All files (*.*)')
+            elif ext in ('.yaml', '.yml'):
+                file_types = ('YAML (*.yaml;*.yml)', 'All files (*.*)')
+            else:
+                file_types = ('Text 파일 (*.txt)', 'All files (*.*)')
             result = self._window.create_file_dialog(
-                dialog_type,
-                save_filename=filename,
-                file_types=('Text files (*.txt *.log)', 'All files (*.*)'),
+                dialog_type, save_filename=filename, file_types=file_types,
             )
             if not result:
-                return {'ok': False, 'error': 'cancelled'}
+                return {'ok': False, 'canceled': True}
             path = result[0] if isinstance(result, (list, tuple)) else result
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return {'ok': True, 'path': path}
+            Path(path).write_text('' if content is None else str(content), encoding='utf-8')
+            return {'ok': True, 'path': str(path)}
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 

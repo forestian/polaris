@@ -142,6 +142,8 @@ export default function TerminalPage() {
             fontFamily: 'var(--font-mono)', userSelect: 'text', cursor: 'text',
           }}
           onClick={() => {
+            // 드래그로 텍스트를 선택한 경우엔 포커스를 가로채지 않아 선택이 유지됨
+            // (선택 후 Ctrl+C 또는 헤더의 복사 버튼으로 복사 가능)
             const sel = window.getSelection()
             if (!sel || sel.isCollapsed) inputRef.current?.focus()
           }}

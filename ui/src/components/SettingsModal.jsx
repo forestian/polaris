@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useApp } from '../store.jsx'
+import { api } from '../api.js'
 import { applyTheme, normalizeThemeId, THEME_IDS, THEMES } from '../themeRegistry.js'
 import {
   Check,
@@ -8,16 +9,25 @@ import {
   Palette,
   RotateCw,
   Settings as SettingsIcon,
+  KeyRound,
+  Lock,
+  Unlock,
+  AlertCircle,
+  FolderCog,
+  FolderOpen,
   X,
 } from 'lucide-react'
 
 const TABS = [
   { id: 'exit', label: '종료 옵션', icon: SettingsIcon },
+  { id: 'security', label: '보안 잠금', icon: KeyRound },
+  { id: 'data', label: '데이터 폴더', icon: FolderCog },
   { id: 'theme', label: '배경 테마', icon: Palette },
 ]
 
 export default function SettingsModal() {
-  const { setShowSettings, settings, saveSettings } = useApp()
+  const { setShowSettings, settings, saveSettings,
+          vaultStatus, vaultSetAutoUnlock } = useApp()
   const [draft, setDraft] = useState(() => normalizeSettings(settings))
   const [activeTab, setActiveTab] = useState('exit')
   const [saving, setSaving] = useState(false)
@@ -96,9 +106,12 @@ export default function SettingsModal() {
         </div>
 
         <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-          {activeTab === 'exit' ? (
-            <ExitOptionsTab draft={draft} update={update} />
-          ) : (
+          {activeTab === 'exit' && <ExitOptionsTab draft={draft} update={update} />}
+          {activeTab === 'security' && (
+            <SecurityTab vaultStatus={vaultStatus} vaultSetAutoUnlock={vaultSetAutoUnlock} />
+          )}
+          {activeTab === 'data' && <DataFolderTab />}
+          {activeTab === 'theme' && (
             <ThemeTab selected={draft.themeId} onSelect={themeId => update('themeId', themeId)} />
           )}
         </div>
@@ -191,6 +204,168 @@ function ExitOptionsTab({ draft, update }) {
         )}
       </section>
     </>
+  )
+}
+
+function SecurityTab({ vaultStatus, vaultSetAutoUnlock }) {
+  const [busy, setBusy] = React.useState(false)
+  const [msg, setMsg] = React.useState(null)   // {kind, text}
+
+  if (vaultStatus?.available === false) {
+    return (
+      <section>
+        <h3 style={sectionTitleStyle}>잠금 해제 방식</h3>
+        <p style={descStyle}>이 빌드는 보안 보관함(암호화)을 사용하지 않습니다.</p>
+      </section>
+    )
+  }
+
+  const auto = vaultStatus?.has_dpapi === true
+
+  async function choose(enable) {
+    if (busy || enable === auto) return
+    setBusy(true); setMsg(null)
+    const r = await vaultSetAutoUnlock(enable)
+    setBusy(false)
+    setMsg(r?.ok
+      ? { kind: 'ok', text: enable ? '자동 잠금 해제로 변경됨' : '매번 비밀번호 입력으로 변경됨' }
+      : { kind: 'error', text: r?.error || '변경 실패' })
+  }
+
+  return (
+    <section>
+      <h3 style={sectionTitleStyle}>잠금 해제 방식</h3>
+      <p style={descStyle}>
+        프로그램을 열 때 보안 보관함(kubeconfig·SSH 접속정보·스냅샷)을 어떻게 해제할지 선택합니다.
+        지금 바로 적용됩니다.
+      </p>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+        <RadioCard
+          icon={Lock}
+          selected={!auto}
+          onClick={() => choose(false)}
+          title="매번 비밀번호 입력 (권장)"
+          desc="가장 안전 · 실행할 때마다 마스터 비밀번호로 로그인합니다."
+          color="var(--nimbus)"
+        />
+        <RadioCard
+          icon={Unlock}
+          selected={auto}
+          onClick={() => choose(true)}
+          title="자동 잠금 해제 (이 PC)"
+          desc="비밀번호 생략 · 현재 Windows 계정(DPAPI)에서만 자동 해제됩니다. 다른 PC/계정에서는 비밀번호가 필요합니다."
+          color="var(--blue)"
+        />
+      </div>
+      {msg && (
+        <div style={{
+          marginTop: 10, padding: '8px 12px', borderRadius: 5, fontSize: 11.5,
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: msg.kind === 'ok' ? 'rgba(52,211,153,0.1)' : 'rgba(239,68,68,0.1)',
+          border: `1px solid ${msg.kind === 'ok' ? 'rgba(52,211,153,0.3)' : 'rgba(239,68,68,0.3)'}`,
+          color: 'var(--text-mid)',
+        }}>
+          {msg.kind === 'ok'
+            ? <Check size={12} color="var(--nimbus)" />
+            : <AlertCircle size={12} color="var(--red)" />}
+          {msg.text}
+        </div>
+      )}
+      <p style={{ ...descStyle, marginTop: 12 }}>
+        ※ 마스터 비밀번호 변경은 좌하단 <strong>보안 보관함</strong> 박스에서 할 수 있습니다.
+      </p>
+    </section>
+  )
+}
+
+function DataFolderTab() {
+  const [cur, setCur] = useState(null)        // {path, is_default, default}
+  const [picked, setPicked] = useState('')    // 사용자가 고른 새 경로
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)  // 변경 성공 결과 {old_dir, new_dir}
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    api.getDataDir().then(r => { if (r?.ok) setCur(r) }).catch(() => {})
+  }, [])
+
+  async function pickFolder() {
+    setErr('')
+    const p = await api.browseFolder(cur?.path || null)
+    if (p) setPicked(p)
+  }
+
+  async function apply() {
+    if (!picked) { setErr('새 폴더를 선택하세요.'); return }
+    setBusy(true); setErr(''); setResult(null)
+    const r = await api.changeDataDir(picked)
+    setBusy(false)
+    if (r?.ok) { setResult(r); setPicked('') }
+    else setErr(r?.error || '변경 실패')
+  }
+
+  return (
+    <section>
+      <h3 style={sectionTitleStyle}>데이터 폴더 위치</h3>
+      <p style={descStyle}>
+        vault·kubeconfig·스냅샷·세션·로그 등 모든 데이터가 저장되는 폴더입니다.
+        위치를 바꾸면 현재 파일을 새 폴더로 <strong>복사</strong>합니다.
+      </p>
+
+      <div style={{
+        marginTop: 10, padding: '9px 12px', borderRadius: 6,
+        background: 'var(--bg-3)', border: '1px solid var(--border)',
+        fontSize: 11.5, fontFamily: 'var(--font-mono)', color: 'var(--text)',
+        wordBreak: 'break-all',
+      }}>
+        {cur ? cur.path : '...'}
+        {cur?.is_default && <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--font)' }}> (기본값)</span>}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+        <input
+          value={picked}
+          onChange={e => setPicked(e.target.value)}
+          placeholder="새 폴더 경로 (또는 찾아보기)"
+          disabled={busy}
+          style={{
+            flex: 1, padding: '7px 10px', boxSizing: 'border-box',
+            background: 'var(--bg-3)', border: '1px solid var(--border)',
+            borderRadius: 5, color: 'var(--text-bright)', fontSize: 11.5,
+          }}
+        />
+        <button className="btn btn-default" onClick={pickFolder} disabled={busy} style={{ gap: 5, flexShrink: 0 }}>
+          <FolderOpen size={13} /> 찾아보기
+        </button>
+        <button className="btn btn-primary" onClick={apply} disabled={busy || !picked} style={{ flexShrink: 0 }}>
+          {busy ? '복사 중...' : '변경'}
+        </button>
+      </div>
+
+      {err && (
+        <div style={{
+          marginTop: 10, padding: '8px 12px', borderRadius: 5, fontSize: 11.5,
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: 'var(--text-mid)',
+        }}>
+          <AlertCircle size={12} color="var(--red)" /> {err}
+        </div>
+      )}
+
+      {result && (
+        <div style={{
+          marginTop: 10, padding: '11px 13px', borderRadius: 6, fontSize: 11.5, lineHeight: 1.7,
+          background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.3)', color: 'var(--text)',
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>복사 완료 — 재시작 후 적용됩니다</div>
+          <div>새 위치: <code>{result.new_dir}</code></div>
+          <div style={{ marginTop: 6, color: 'var(--text-mid)' }}>
+            기존 폴더는 자동 삭제되지 않습니다. 정상 동작을 확인한 뒤 아래 폴더를 직접 삭제하세요:
+          </div>
+          <div><code>{result.old_dir}</code></div>
+        </div>
+      )}
+    </section>
   )
 }
 

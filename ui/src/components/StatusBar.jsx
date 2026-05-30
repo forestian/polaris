@@ -2,7 +2,7 @@ import React from 'react'
 import { useApp } from '../store.jsx'
 
 export default function StatusBar() {
-  const { connected, kubeVersion, appVersion, clusterName, setShowConnect } = useApp()
+  const { connected, kubeVersion, appVersion, clusterName } = useApp()
 
   return (
     <div style={{
@@ -31,14 +31,6 @@ export default function StatusBar() {
       )}
 
       <span style={{ flex: 1 }} />
-
-      {!connected && (
-        <button className="btn btn-primary btn-sm"
-          style={{ marginRight: 12 }}
-          onClick={() => setShowConnect(true)}>
-          kubeconfig 연결
-        </button>
-      )}
 
       <span style={{ color: 'var(--text-dim)' }}>F5 새로고침 · ⌘K 검색</span>
       <span style={{ marginLeft: 14, color: 'var(--text-mid)', fontWeight: 500 }}>

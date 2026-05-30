@@ -184,6 +184,10 @@ html, body, #root {
   border-top-color: var(--nimbus);
   animation: spin 0.7s linear infinite;
 }
+/* lucide 아이콘 등 임의 요소 회전 유틸 */
+.spin { animation: spin 0.8s linear infinite; }
+/* 보안 보관함 드로어 슬라이드인 */
+@keyframes vaultDrawerIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
 
 /* ── 빈 상태 ── */
 .empty-state {

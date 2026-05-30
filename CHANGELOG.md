@@ -22,6 +22,33 @@
 
 ---
 
+## v1.2.2-f1 — 2026-05-30  ·  운영 점검 + 보안 보관함 (무료 빌드 갱신)
+
+v1.0.13-e1 이후 쌓인 코어 기능을 무료 빌드에 반영. (앱 카탈로그 · infra 관리 미포함)
+
+### 추가 — 운영 점검
+- **클러스터 스냅샷 + 시점 비교(Diff)** — 클러스터 상태를 시점별로 저장하고 두 시점을 비교:
+  리소스 추가(+)/삭제(−)/변경(~) + 변경 필드별 `old → new`, 새로 생긴/해결된 이슈 추이
+- **RBAC 분석** — ServiceAccount 권한 역추적(binding → role → 권한), 전체 권한/cluster-admin 경고
+- **DOCX 운영 점검 보고서** — 과도 권한(cluster-admin·와일드카드) 발견 사항 자동 추가
+- **CRD 자동 발견** — 커스텀 리소스 조회 + additionalPrinterColumns + 객체 YAML 편집/삭제
+- **리소스 쓰기** — YAML 적용(`kubectl apply`) / Scale / Rollout Restart (확인 모달)
+
+### 추가 — 보안 보관함 (Vault)
+- **시작 잠금** — 프로그램 실행 시 마스터 비밀번호로 잠금 해제 (첫 실행 생성)
+- **암호화 보관** — kubeconfig·클러스터 스냅샷을 AES-256-GCM + scrypt 로 암호화
+  (스냅샷은 raw 파일로 열어도 내용 식별 불가, 앱에서만 열람·비교)
+- kubeconfig 자동 복원 · 잠금 방식 선택(매번 비번 / 자동) · 데이터 폴더 위치 변경
+
+### 검증
+- `python -m unittest discover tests` PASS · `--selfcheck` enabled_features 빈 배열 (옵셔널 plugin 0)
+- CI (python-lint + ui-build) green
+
+### 산출물
+- `dist/polaris.exe` (재빌드) · GitHub release v1.2.2-f1 + SHA-256/512 체크섬
+
+---
+
 ## v1.0.13-e1 — 2026-05-27  ·  k9s 원클릭 설치
 
 ### 추가
@@ -51,11 +78,11 @@
 ## v1.0.10-e2 — 2026-05-26  ·  보고서 '작성 조직' 행 제거
 
 무료 빌드용 패치 — DOCX 운영 점검 보고서에서 표지 페이지와 1.3 점검 정보 표의
-'작성 조직: Nimbus Networks' 행을 제거. 외부 사용자에게 부적절한 사내 조직명이
+'작성 조직' 행을 제거. 외부 사용자에게 부적절한 사내 조직명이
 보고서에 박혀있던 문제 해결.
 
 ### 변경
-- `src/reports.py`: `Nimbus Networks` 하드코딩 2곳 제거
+- `src/reports.py`: 조직명 하드코딩 2곳 제거
   - 표지 페이지 (line 693 일대) — 점검 일시 / 클러스터 / 노드 만 표시
   - 1.3 점검 정보 표 (line 743 일대) — '작성 조직' 행 자체 제거
 

@@ -2,11 +2,17 @@ import React, { useState, useEffect } from 'react'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
 import { buildPodExecCommand, buildPodLogTarget } from '../navigationTargets.js'
-import { X, RefreshCw, ChevronDown, Copy, Maximize2, Terminal, Play } from 'lucide-react'
+import { X, RefreshCw, ChevronDown, Copy, Maximize2, Terminal, Play,
+         Pencil, Check, RotateCw, Scale } from 'lucide-react'
 import MetricsTab from './MetricsTab.jsx'
 
 const TABS_POD     = ['개요', '이벤트', '메트릭', '로그', 'YAML', 'Describe']
 const TABS_DEFAULT = ['개요', '이벤트', 'YAML', 'Describe']
+
+// scale / rollout restart 가능한 워크로드 종류
+const SCALABLE_KINDS   = new Set(['deployments', 'statefulsets', 'replicasets'])
+const RESTARTABLE_KINDS = new Set(['deployments', 'statefulsets', 'daemonsets'])
+const SECRET_KINDS      = new Set(['secrets', 'secret'])
 
 // ── 복사 가능한 모노스페이스 블록 ─────────────────────────────────────────────
 function MonoBlock({ text, maxHeight = 480 }) {
@@ -85,6 +91,9 @@ function ErrMsg({ msg }) {
 export default function ResourcePanel({ item, kind, onClose, onDelete }) {
   const isPod     = kind === 'pods'
   const isCronJob = kind === 'cronjobs'
+  const isScalable    = SCALABLE_KINDS.has(kind)
+  const isRestartable = RESTARTABLE_KINDS.has(kind)
+  const isSecret      = SECRET_KINDS.has(kind)
   const TABS  = isPod ? TABS_POD : TABS_DEFAULT
   const { navigate, setLogTarget, setTerminalCommand } = useApp()
 
@@ -99,6 +108,14 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
   const [busy, setBusy]         = useState(false)
   const [triggerMsg, setTriggerMsg] = useState(null)   // {ok, text} CronJob 트리거 결과
 
+  // 리소스 쓰기 상태
+  const [editMode, setEditMode] = useState(false)      // YAML 편집 모드
+  const [editText, setEditText] = useState('')         // textarea 내용
+  const [writeMsg, setWriteMsg] = useState(null)       // {ok, text} apply/scale/restart 결과
+  const [confirm, setConfirm]   = useState(null)       // {title, body, onYes} 확인 모달
+  const [scaleModal, setScaleModal] = useState(false)  // replicas 입력 모달
+  const [scaleValue, setScaleValue] = useState('')
+
   const ns   = item?.namespace || ''
   const name = item?.name      || ''
 
@@ -109,6 +126,8 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     setDetail(null); setEvents(null); setLogs(null)
     setYaml(null);   setDescribe(null); setContainer('')
     setTriggerMsg(null)
+    setEditMode(false); setEditText(''); setWriteMsg(null); setConfirm(null)
+    setScaleModal(false); setScaleValue('')
 
     if (isPod) loadDetail()
     loadEvents()
@@ -190,6 +209,101 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     setBusy(false)
   }
 
+  // ── 리소스 쓰기 ───────────────────────────────────────────────────────────
+  function startEdit() {
+    if (isSecret) return
+    setEditText(yaml?.yaml || '')
+    setWriteMsg(null)
+    setEditMode(true)
+  }
+
+  function cancelEdit() {
+    setEditMode(false)
+    setEditText('')
+    setWriteMsg(null)
+  }
+
+  function requestApply() {
+    setConfirm({
+      title: 'YAML 적용',
+      body: `편집한 YAML 을 클러스터에 적용합니다.\n\n${kind} / ${name}\n\nkubectl apply 와 동일하게 동작합니다. 계속하시겠습니까?`,
+      onYes: doApply,
+    })
+  }
+
+  async function doApply() {
+    setConfirm(null); setBusy(true); setWriteMsg(null)
+    try {
+      const r = await api.applyResourceYaml(editText, kind)
+      if (r?.ok) {
+        setWriteMsg({ ok: true, text: r.output || '적용 완료' })
+        setEditMode(false)
+        await loadYaml()   // 적용 후 최신 상태 다시 로드
+      } else {
+        setWriteMsg({ ok: false, text: r?.error || '적용 실패' })
+      }
+    } catch (e) {
+      setWriteMsg({ ok: false, text: String(e) })
+    }
+    setBusy(false)
+  }
+
+  // 현재 replicas 추출 (item.ready 가 "1/3" 형태면 분모 사용)
+  function currentReplicas() {
+    const r = item?.ready
+    if (typeof r === 'string' && r.includes('/')) return r.split('/')[1] || ''
+    return item?.desired ?? ''
+  }
+
+  function requestScale() {
+    setScaleValue(String(currentReplicas() || ''))
+    setScaleModal(true)
+  }
+
+  function submitScale() {
+    const n = parseInt(String(scaleValue).trim(), 10)
+    if (isNaN(n) || n < 0 || n > 1000) {
+      setWriteMsg({ ok: false, text: 'replicas 는 0~1000 정수여야 합니다.' })
+      return
+    }
+    setScaleModal(false)
+    doScale(n)
+  }
+
+  async function doScale(n) {
+    setConfirm(null); setBusy(true); setWriteMsg(null)
+    try {
+      const r = await api.scaleResource(kind, ns, name, n)
+      setWriteMsg(r?.ok
+        ? { ok: true, text: r.output || `replicas=${n} 적용됨` }
+        : { ok: false, text: r?.error || 'scale 실패' })
+    } catch (e) {
+      setWriteMsg({ ok: false, text: String(e) })
+    }
+    setBusy(false)
+  }
+
+  function requestRestart() {
+    setConfirm({
+      title: 'Rollout Restart',
+      body: `${kind} / ${name}\n\n파드를 순차적으로 재시작합니다 (rollout restart). 계속하시겠습니까?`,
+      onYes: doRestart,
+    })
+  }
+
+  async function doRestart() {
+    setConfirm(null); setBusy(true); setWriteMsg(null)
+    try {
+      const r = await api.rolloutRestart(kind, ns, name)
+      setWriteMsg(r?.ok
+        ? { ok: true, text: r.output || '재시작 요청됨' }
+        : { ok: false, text: r?.error || 'restart 실패' })
+    } catch (e) {
+      setWriteMsg({ ok: false, text: String(e) })
+    }
+    setBusy(false)
+  }
+
   async function loadDescribe() {
     setBusy(true)
     try {
@@ -231,7 +345,7 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
 
   return (
     <div style={{
-      width: 500, flexShrink: 0,
+      width: 500, flexShrink: 0, position: 'relative',
       display: 'flex', flexDirection: 'column',
       borderLeft: '1px solid var(--border)',
       background: 'var(--bg-1)',
@@ -272,6 +386,20 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
             disabled={busy} title="CronJob을 스케줄과 무관하게 즉시 1회 실행"
             style={{ flexShrink: 0, gap: 4 }}>
             <Play size={11} /> 지금 실행
+          </button>
+        )}
+        {isScalable && (
+          <button className="btn btn-default btn-sm" onClick={requestScale}
+            disabled={busy} title="replicas 수 변경 (kubectl scale)"
+            style={{ flexShrink: 0, gap: 4 }}>
+            <Scale size={12} /> Scale
+          </button>
+        )}
+        {isRestartable && (
+          <button className="btn btn-default btn-sm" onClick={requestRestart}
+            disabled={busy} title="파드 순차 재시작 (kubectl rollout restart)"
+            style={{ flexShrink: 0, gap: 4 }}>
+            <RotateCw size={12} /> Restart
           </button>
         )}
         <button className="btn btn-danger btn-sm" onClick={() => onDelete?.(item)}
@@ -571,14 +699,76 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
         {/* ════ YAML ════ */}
         {tab === 'YAML' && (
           <div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
-              <button className="btn btn-ghost btn-sm" onClick={loadYaml} disabled={busy}>
-                <RefreshCw size={11} /> 새로고침
-              </button>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginBottom: 8 }}>
+              {!editMode && (
+                <>
+                  <button className="btn btn-ghost btn-sm" onClick={loadYaml} disabled={busy}>
+                    <RefreshCw size={11} /> 새로고침
+                  </button>
+                  {!isSecret && yaml?.ok && (
+                    <button className="btn btn-default btn-sm" onClick={startEdit} disabled={busy}
+                      style={{ gap: 4 }}>
+                      <Pencil size={11} /> 편집
+                    </button>
+                  )}
+                </>
+              )}
+              {editMode && (
+                <>
+                  <button className="btn btn-ghost btn-sm" onClick={cancelEdit} disabled={busy}>
+                    취소
+                  </button>
+                  <button className="btn btn-primary btn-sm" onClick={requestApply} disabled={busy}
+                    style={{ gap: 4 }}>
+                    <Check size={11} /> 적용 (Apply)
+                  </button>
+                </>
+              )}
             </div>
-            {yaml === null ? <Loading /> :
-             yaml.ok === false ? <ErrMsg msg={yaml.error} /> :
-             <MonoBlock text={yaml.yaml} maxHeight={520} />}
+
+            {/* Secret 편집 불가 안내 */}
+            {isSecret && (
+              <div style={{
+                fontSize: 11, color: 'var(--yellow)', marginBottom: 8,
+                padding: '6px 10px', background: 'rgba(251,191,36,0.08)',
+                border: '1px solid rgba(251,191,36,0.25)', borderRadius: 4,
+              }}>
+                ⚠ Secret 은 보안상 값이 마스킹되어 표시되며 편집·적용이 차단됩니다.
+              </div>
+            )}
+
+            {/* apply 결과 메시지 */}
+            {writeMsg && (
+              <div style={{
+                fontSize: 11, marginBottom: 8, padding: '6px 10px', borderRadius: 4,
+                whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                color: writeMsg.ok ? 'var(--nimbus)' : 'var(--red)',
+                background: writeMsg.ok ? 'rgba(52,211,153,0.08)' : 'rgba(248,113,113,0.08)',
+                border: `1px solid ${writeMsg.ok ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)'}`,
+              }}>
+                {writeMsg.ok ? '✓ ' : '✗ '}{writeMsg.text}
+              </div>
+            )}
+
+            {editMode ? (
+              <textarea
+                value={editText}
+                onChange={e => setEditText(e.target.value)}
+                spellCheck={false}
+                style={{
+                  width: '100%', height: 480, resize: 'vertical',
+                  fontFamily: 'var(--font-mono)', fontSize: 11, lineHeight: 1.6,
+                  padding: '10px 12px', background: 'var(--bg-0)',
+                  border: '1px solid var(--nimbus)', borderRadius: 6,
+                  color: 'var(--text)', outline: 'none', whiteSpace: 'pre',
+                  overflowWrap: 'normal', boxSizing: 'border-box',
+                }}
+              />
+            ) : (
+              yaml === null ? <Loading /> :
+              yaml.ok === false ? <ErrMsg msg={yaml.error} /> :
+              <MonoBlock text={yaml.yaml} maxHeight={520} />
+            )}
           </div>
         )}
 
@@ -597,6 +787,90 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
         )}
 
       </div>
+
+      {/* ── 작업 결과 메시지 (YAML 탭 외 — scale/restart) ── */}
+      {writeMsg && tab !== 'YAML' && (
+        <div style={{
+          position: 'absolute', left: 12, right: 12, bottom: 12, zIndex: 20,
+          fontSize: 11, padding: '8px 12px', borderRadius: 6,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+          color: writeMsg.ok ? 'var(--nimbus)' : 'var(--red)',
+          background: writeMsg.ok ? 'rgba(52,211,153,0.12)' : 'rgba(248,113,113,0.12)',
+          border: `1px solid ${writeMsg.ok ? 'var(--nimbus)' : 'var(--red)'}`,
+          display: 'flex', justifyContent: 'space-between', gap: 8,
+        }}>
+          <span>{writeMsg.ok ? '✓ ' : '✗ '}{writeMsg.text}</span>
+          <button onClick={() => setWriteMsg(null)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer',
+                     color: 'inherit', fontSize: 12, flexShrink: 0 }}>×</button>
+        </div>
+      )}
+
+      {/* ── Replicas 입력 모달 ── */}
+      {scaleModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          background: 'rgba(0,0,0,0.55)', display: 'grid', placeItems: 'center',
+        }} onClick={() => setScaleModal(false)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            width: 380, maxWidth: '90vw', background: 'var(--bg-2)',
+            border: '1px solid var(--border)', borderRadius: 8, padding: 20,
+            boxShadow: '0 12px 48px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-bright)',
+              marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Scale size={15} /> Replicas 조정
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 4,
+              fontFamily: 'var(--font-mono)' }}>{kind} / {name}</div>
+            <div style={{ fontSize: 12.5, color: 'var(--text)', marginBottom: 14 }}>
+              변경할 replicas 수 (0~1000)
+            </div>
+            <input
+              type="number" min={0} max={1000} autoFocus
+              value={scaleValue}
+              onChange={e => setScaleValue(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') submitScale()
+                if (e.key === 'Escape') setScaleModal(false)
+              }}
+              style={{
+                width: '100%', boxSizing: 'border-box', marginBottom: 18,
+                padding: '8px 12px', fontSize: 14, fontFamily: 'var(--font-mono)',
+                background: 'var(--bg-0)', border: '1px solid var(--nimbus)',
+                borderRadius: 6, color: 'var(--text-bright)', outline: 'none',
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-ghost btn-sm" onClick={() => setScaleModal(false)}>취소</button>
+              <button className="btn btn-primary btn-sm" onClick={submitScale}>적용</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 확인 모달 (apply / scale / restart) ── */}
+      {confirm && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          background: 'rgba(0,0,0,0.55)', display: 'grid', placeItems: 'center',
+        }} onClick={() => setConfirm(null)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            width: 420, maxWidth: '90vw', background: 'var(--bg-2)',
+            border: '1px solid var(--border)', borderRadius: 8, padding: 20,
+            boxShadow: '0 12px 48px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-bright)',
+              marginBottom: 10 }}>{confirm.title}</div>
+            <div style={{ fontSize: 12.5, color: 'var(--text)', lineHeight: 1.6,
+              whiteSpace: 'pre-wrap', marginBottom: 18 }}>{confirm.body}</div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-ghost btn-sm" onClick={() => setConfirm(null)}>취소</button>
+              <button className="btn btn-primary btn-sm" onClick={confirm.onYes}>확인</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

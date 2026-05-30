@@ -62,6 +62,11 @@ _REPORT_SEVERITY_LEVEL = {
 }
 
 
+def _report_org():
+    """보고서 작성 조직명. 이 빌드에서는 조직 정보를 표기하지 않는다 (None)."""
+    return None
+
+
 def _report_finding(category: str, severity: str, namespace: str, name: str,
                     value: str, detail: str, rec: str) -> dict:
     severity = (severity or 'info').lower()
@@ -144,6 +149,7 @@ def _report_collect(k8s, log_fn):
         ('resource_quotas',  k8s.get_resource_quotas),
         ('limit_ranges',     k8s.get_limit_ranges),
         ('rbac',             k8s.get_rbac_summary),
+        ('rbac_risky',       k8s.get_rbac_risky_subjects),   # 과도 권한 SA (v1.2.2)
         ('kube_system',      k8s.get_kube_system_info),
     ]
     for key, fn in steps:
@@ -313,6 +319,21 @@ def _report_evaluate(data):
                 f'ready {ready}/{desired}', 'Deployment 레플리카 부족',
                 'kubectl rollout status deployment 로 확인',
             ))
+
+    # 11. RBAC 과도 권한 (cluster-admin / 와일드카드) — 보안 (v1.2.2)
+    for r in (data.get('rbac_risky') or []):
+        skind = r.get('subject_kind', '') or 'Subject'
+        sname = r.get('name', '') or '-'
+        subj  = f'{skind}/{sname}'
+        # ServiceAccount 가 클러스터 관리자급 권한을 가지면 가장 위험(critical)
+        sev = 'critical' if skind == 'ServiceAccount' else 'high'
+        findings.append(_report_finding(
+            'rbac', sev, r.get('namespace', '') or 'cluster', subj,
+            r.get('reason', '과도한 권한'),
+            f"{r.get('binding_kind', '')} '{r.get('binding', '')}' → "
+            f"{r.get('role_kind', '')} '{r.get('role', '')}' (클러스터 전체 제어 가능)",
+            '최소 권한 원칙에 따라 전용 Role 로 필요한 권한만 부여하세요',
+        ))
 
     order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
     findings.sort(key=lambda f: order.get(f.get('severity', 'info'), 9))
@@ -688,11 +709,13 @@ def _report_write_docx(data, findings, llm_fn, out_path, log_fn):
     r2 = p2.add_run('운영 점검 리포트')
     _rfont(r2, size=22, bold=True, color=NAVY)
     spacer()
-    for txt, sz, clr in [
+    _org = _report_org()
+    for txt, sz, clr in [row for row in [
         (f"점검 일시: {data.get('collected_at', '')}", 12, GRAY),
+        (f'작성 조직: {_org}', 12, GRAY) if _org else None,
         (f"클러스터: {data.get('cluster_version', 'N/A')}", 11, GRAY),
         (f"노드: {len(nodes_all)}개", 11, GRAY),
-    ]:
+    ] if row]:
         p3 = doc.add_paragraph()
         p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
         r3 = p3.add_run(txt)
@@ -737,15 +760,16 @@ def _report_write_docx(data, findings, llm_fn, out_path, log_fn):
                  '발견 이슈 분석 및 개선 우선순위']:
         bullet(item)
     h2('1.3 점검 정보')
-    tbl(['항목', '내용'], [
+    tbl(['항목', '내용'], [row for row in [
         ['클러스터 버전',   data.get('cluster_version', 'N/A')],
         ['점검 일시',       data.get('collected_at', '')],
+        (['작성 조직', _org] if _org else None),
         ['노드 수',         f"{len(nodes_all)}개"],
         ['전체 파드 수',    f"{len(pods_all)}개"],
         ['네임스페이스 수', f"{len(nss)}개"],
         ['발견 이슈',       f"긴급 {ko_counts['긴급']}건 / 높음 {ko_counts['높음']}건 / "
                             f"중간 {ko_counts['중간']}건"],
-    ], col_widths=[4, 12.5])
+    ] if row], col_widths=[4, 12.5])
     doc.add_page_break()
 
     # ═══════════════════════════════════════════════════════════════════════════

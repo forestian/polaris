@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -363,6 +366,324 @@ class ResourceEventFilterTests(unittest.TestCase):
         )
 
 
+class ResourceWriteArgsTests(unittest.TestCase):
+    def test_scale_args_basic(self):
+        self.assertEqual(
+            polaris._build_scale_args('deployments', 'default', 'web', 3),
+            ['-n', 'default', 'scale', 'deployments', 'web', '--replicas=3'],
+        )
+
+    def test_scale_args_alias_and_no_namespace(self):
+        self.assertEqual(
+            polaris._build_scale_args('sts', '', 'db', 0),
+            ['scale', 'statefulsets', 'db', '--replicas=0'],
+        )
+
+    def test_scale_args_rejects_non_scalable_kind(self):
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('pods', 'ns', 'p', 1)
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('services', 'ns', 'svc', 1)
+
+    def test_scale_args_rejects_bad_replicas(self):
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('deployments', 'ns', 'w', -1)
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('deployments', 'ns', 'w', 99999)
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('deployments', 'ns', 'w', 'abc')
+
+    def test_scale_args_rejects_bad_name(self):
+        with self.assertRaises(ValueError):
+            polaris._build_scale_args('deployments', 'ns', 'Bad_Name!', 1)
+
+    def test_restart_args_basic(self):
+        self.assertEqual(
+            polaris._build_rollout_restart_args('deployment', 'default', 'web'),
+            ['-n', 'default', 'rollout', 'restart', 'deployments/web'],
+        )
+
+    def test_restart_args_daemonset_no_namespace(self):
+        self.assertEqual(
+            polaris._build_rollout_restart_args('ds', '', 'fluentd'),
+            ['rollout', 'restart', 'daemonsets/fluentd'],
+        )
+
+    def test_restart_args_rejects_non_restartable_kind(self):
+        with self.assertRaises(ValueError):
+            polaris._build_rollout_restart_args('services', 'ns', 'svc')
+        with self.assertRaises(ValueError):
+            polaris._build_rollout_restart_args('replicasets', 'ns', 'rs')
+
+    def test_normalize_kubectl_kind(self):
+        self.assertEqual(polaris._normalize_kubectl_kind('deploy'), 'deployments')
+        self.assertEqual(polaris._normalize_kubectl_kind('sts'), 'statefulsets')
+        self.assertEqual(polaris._normalize_kubectl_kind('pvc'), 'persistentvolumeclaims')
+
+
+class VersionerNoiseTests(unittest.TestCase):
+    def test_strips_rke2_versioner_download_log(self):
+        sample = (
+            'I0529 22:07:37.362514 24732 versioner.go:115] Right kubectl missing, '
+            'downloading version 1.32.13+rke2r1 Downloading '
+            'https://dl.k8s.io/release/v1.32.13/bin/windows/amd64/kubectl.exe\n'
+            'kubectl1.32.13+rke2r1.exe 0% |   | (16 kB/60 MB) [0s:0s]\n'
+            'kubectl1.32.13+rke2r1.exe 50% |##| (30/60 MB, 3.8 MB/s) [2s:12s]\n'
+            'apiVersion: v1\n'
+            'kind: Pod\n'
+            'metadata:\n'
+            '  name: web\n'
+        )
+        out = polaris._strip_versioner_noise(sample)
+        self.assertNotIn('versioner', out)
+        self.assertNotIn('Downloading', out)
+        self.assertNotIn('.exe ', out)
+        self.assertIn('apiVersion: v1', out)
+        self.assertIn('kind: Pod', out)
+        self.assertTrue(out.startswith('apiVersion: v1'))
+
+    def test_leaves_clean_output_untouched(self):
+        clean = 'apiVersion: v1\nkind: Service\nmetadata:\n  name: svc\n'
+        self.assertEqual(polaris._strip_versioner_noise(clean), clean)
+
+    def test_handles_carriage_return_progress(self):
+        sample = ('kubectl1.32.exe 10% |#| (6/60 MB)\r'
+                  'kubectl1.32.exe 90% |####| (54/60 MB)\r'
+                  'kind: Pod\n')
+        out = polaris._strip_versioner_noise(sample)
+        self.assertIn('kind: Pod', out)
+        self.assertNotIn('60 MB', out)
+
+
+class CrdParsingTests(unittest.TestCase):
+    def test_parse_ts_iso_string(self):
+        from src.k8s import _parse_ts
+        dt = _parse_ts('2024-01-01T00:00:00Z')
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2024)
+        self.assertIsNotNone(dt.tzinfo)
+
+    def test_parse_ts_none_and_garbage(self):
+        from src.k8s import _parse_ts
+        self.assertIsNone(_parse_ts(None))
+        self.assertIsNone(_parse_ts('not-a-date'))
+
+    def test_crd_api_methods_exist(self):
+        api = polaris.PolarisAPI()
+        self.assertTrue(callable(getattr(api, 'get_crds', None)))
+        self.assertTrue(callable(getattr(api, 'get_crd_objects', None)))
+
+    def test_jsonpath_simple_dot_paths(self):
+        from src.k8s import _jsonpath_get
+        obj = {'status': {'phase': 'Ready'}, 'spec': {'replicas': 3, 'paused': False}}
+        self.assertEqual(_jsonpath_get(obj, '.status.phase'), 'Ready')
+        self.assertEqual(_jsonpath_get(obj, '.spec.replicas'), '3')
+        self.assertEqual(_jsonpath_get(obj, '.spec.paused'), 'false')
+
+    def test_jsonpath_missing_and_complex(self):
+        from src.k8s import _jsonpath_get
+        obj = {'status': {'conditions': [{'type': 'Ready'}]}}
+        self.assertEqual(_jsonpath_get(obj, '.missing.path'), '')
+        self.assertEqual(_jsonpath_get(obj, '.status.conditions'), '')  # list → ''
+        self.assertEqual(_jsonpath_get(obj, ''), '')
+
+
+class SnapshotDiffTests(unittest.TestCase):
+    def _payload(self, deployments, pvcs=None):
+        return {'meta': {'id': 'x', 'created_at': '2026-01-01 00:00:00'},
+                'data': {'deployments': deployments, 'pvcs': pvcs or []}}
+
+    def test_diff_detects_added_removed_changed(self):
+        from src.snapshot import diff_snapshots
+        a = self._payload([
+            {'namespace': 'default', 'name': 'web', 'ready': 2, 'desired': 2},
+            {'namespace': 'default', 'name': 'old', 'ready': 1, 'desired': 1},
+        ])
+        b = self._payload([
+            {'namespace': 'default', 'name': 'web', 'ready': 1, 'desired': 3},
+            {'namespace': 'default', 'name': 'new', 'ready': 1, 'desired': 1},
+        ])
+        d = diff_snapshots(a, b)
+        self.assertEqual(d['totals'], {'added': 1, 'removed': 1, 'changed': 1})
+        dep = next(k for k in d['kinds'] if k['kind'] == 'Deployment')
+        self.assertEqual(dep['added'], ['default/new'])
+        self.assertEqual(dep['removed'], ['default/old'])
+        self.assertEqual(dep['changed'][0]['key'], 'default/web')
+        fields = {f['field'] for f in dep['changed'][0]['fields']}
+        self.assertIn('desired', fields)
+        self.assertIn('ready', fields)
+
+    def test_diff_ignores_age_field(self):
+        from src.snapshot import diff_snapshots
+        a = self._payload([{'namespace': 'd', 'name': 'w', 'ready': 1, 'age': '1d'}])
+        b = self._payload([{'namespace': 'd', 'name': 'w', 'ready': 1, 'age': '8d'}])
+        d = diff_snapshots(a, b)
+        self.assertEqual(d['totals']['changed'], 0)   # age 만 바뀐 건 무시
+
+    def test_diff_no_change(self):
+        from src.snapshot import diff_snapshots
+        a = self._payload([{'namespace': 'd', 'name': 'w', 'ready': 1}])
+        d = diff_snapshots(a, a)
+        self.assertEqual(d['totals'], {'added': 0, 'removed': 0, 'changed': 0})
+        self.assertEqual(d['kinds'], [])
+
+    def test_diff_findings_new_resolved(self):
+        from src.snapshot import diff_findings
+        fa = [{'category': 'pod_restart', 'namespace': 'n', 'name': 'p1'},
+              {'category': 'nodeport', 'namespace': 'n', 'name': 'svc1'}]
+        fb = [{'category': 'pod_restart', 'namespace': 'n', 'name': 'p1'},
+              {'category': 'pvc', 'namespace': 'n', 'name': 'data'}]
+        r = diff_findings(fa, fb)
+        self.assertEqual([f['category'] for f in r['new']], ['pvc'])
+        self.assertEqual([f['category'] for f in r['resolved']], ['nodeport'])
+        self.assertEqual(r['persisting_count'], 1)
+
+    def test_snapshot_api_methods_exist(self):
+        api = polaris.PolarisAPI()
+        for m in ('take_snapshot', 'list_snapshots', 'delete_snapshot', 'diff_snapshots'):
+            self.assertTrue(callable(getattr(api, m, None)), m)
+
+
+class SnapshotEncryptionTests(unittest.TestCase):
+    """v1.2.1 — 스냅샷 파일 암호화 (.enc) 회귀 검증."""
+
+    def setUp(self):
+        import tempfile
+        import src.snapshot as snap
+        from src.vault import HAS_CRYPTO, Vault
+        if not HAS_CRYPTO:
+            self.skipTest('cryptography 미설치')
+        self.snap = snap
+        self.tmp = Path(tempfile.mkdtemp(prefix='polaris-snap-enc-'))
+        self._orig_dir = snap.SNAPSHOT_DIR
+        snap.SNAPSHOT_DIR = self.tmp / 'snaps'
+        self.vault = Vault(self.tmp / 'vault.json')
+        self.vault.create('test1234')   # 생성 직후 unlocked
+        self.data = {
+            'cluster_version': 'v1.29.0',
+            'pods': [{'namespace': 'ns', 'name': 'secret-pod',
+                      'image': 'super-secret-image:1.0'}],
+            '_findings': [],
+        }
+
+    def tearDown(self):
+        import shutil
+        self.snap.SNAPSHOT_DIR = self._orig_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_save_encrypts_and_hides_payload(self):
+        r = self.snap.save_snapshot(self.data, 'prod', label='L', vault=self.vault)
+        self.assertTrue(r['ok'])
+        self.assertTrue(r['encrypted'])
+        self.assertTrue(r['path'].endswith('.enc'))
+        raw = Path(r['path']).read_text(encoding='utf-8')
+        # 민감한 data 는 raw 파일에서 보이면 안 됨
+        self.assertNotIn('secret-pod', raw)
+        self.assertNotIn('super-secret-image', raw)
+        self.assertIn(self.snap._ENC_FORMAT, raw)
+
+    def test_roundtrip_and_lock_behavior(self):
+        r = self.snap.save_snapshot(self.data, 'prod', vault=self.vault)
+        sid = r['id']
+        # 목록은 vault 없이도 meta 표시 (암호화 플래그 포함)
+        items = self.snap.list_snapshots()
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]['encrypted'])
+        # vault 해제 상태 → 복호화 성공
+        loaded = self.snap.load_snapshot(sid, vault=self.vault)
+        self.assertEqual(loaded['data']['pods'][0]['name'], 'secret-pod')
+        # 잠금 → load None
+        self.vault.lock()
+        self.assertIsNone(self.snap.load_snapshot(sid, vault=self.vault))
+        # vault 없이 .enc load → None
+        self.assertIsNone(self.snap.load_snapshot(sid, vault=None))
+
+    def test_save_rejected_when_locked(self):
+        self.vault.lock()
+        r = self.snap.save_snapshot(self.data, 'prod', vault=self.vault)
+        self.assertFalse(r['ok'])   # 평문 저장 금지
+
+    def test_legacy_json_still_readable(self):
+        # crypto 없는 경우(vault=None) → 평문 .json 으로 저장되고 다시 읽힘
+        r = self.snap.save_snapshot(self.data, 'legacy', vault=None)
+        self.assertTrue(r['ok'])
+        self.assertFalse(r['encrypted'])
+        self.assertTrue(r['path'].endswith('.json'))
+        loaded = self.snap.load_snapshot(r['id'], vault=None)
+        self.assertEqual(loaded['data']['pods'][0]['name'], 'secret-pod')
+
+
+class RbacApiTests(unittest.TestCase):
+    def test_rbac_api_methods_exist(self):
+        api = polaris.PolarisAPI()
+        self.assertTrue(callable(getattr(api, 'get_rbac', None)))
+
+    def test_k8smanager_rbac_methods_exist(self):
+        from src.k8s import K8sManager
+        mgr = K8sManager()
+        for m in ('get_rbac_roles', 'get_rbac_bindings', 'get_service_accounts'):
+            self.assertTrue(callable(getattr(mgr, m, None)), m)
+
+    def test_rbac_returns_error_when_disconnected(self):
+        api = polaris.PolarisAPI()
+        r = api.get_rbac()
+        self.assertFalse(r.get('ok'))
+
+
+class RbacRiskyReportTests(unittest.TestCase):
+    """v1.2.2 — 과도 권한 SA → 보고서 발견사항."""
+
+    def _mgr(self):
+        from src.k8s import K8sManager
+        mgr = K8sManager()
+        mgr.get_rbac_roles = lambda inc=False: [
+            {'kind': 'ClusterRole', 'name': 'cluster-admin', 'namespace': '',
+             'rules': [{'verbs': ['*'], 'resources': ['*'], 'apiGroups': ['*']}]},
+            {'kind': 'ClusterRole', 'name': 'custom-wild', 'namespace': '',
+             'rules': [{'verbs': ['*'], 'resources': ['*'], 'apiGroups': ['*']}]},
+            {'kind': 'Role', 'name': 'reader', 'namespace': 'app',
+             'rules': [{'verbs': ['get'], 'resources': ['pods'], 'apiGroups': ['']}]},
+        ]
+        mgr.get_rbac_bindings = lambda inc=False: [
+            {'kind': 'ClusterRoleBinding', 'name': 'admin-binding', 'namespace': '',
+             'role_ref': {'kind': 'ClusterRole', 'name': 'cluster-admin'},
+             'subjects': [{'kind': 'ServiceAccount', 'name': 'ci-deployer', 'namespace': 'ci'},
+                          {'kind': 'Group', 'name': 'system:masters', 'namespace': ''}]},
+            {'kind': 'RoleBinding', 'name': 'wild-binding', 'namespace': 'app',
+             'role_ref': {'kind': 'ClusterRole', 'name': 'custom-wild'},
+             'subjects': [{'kind': 'User', 'name': 'alice', 'namespace': ''}]},
+            {'kind': 'RoleBinding', 'name': 'reader-binding', 'namespace': 'app',
+             'role_ref': {'kind': 'Role', 'name': 'reader'},
+             'subjects': [{'kind': 'ServiceAccount', 'name': 'viewer', 'namespace': 'app'}]},
+        ]
+        return mgr
+
+    def test_detects_admin_and_wildcard_excludes_system_and_normal(self):
+        risky = self._mgr().get_rbac_risky_subjects()
+        names = sorted(r['name'] for r in risky)
+        self.assertEqual(names, ['alice', 'ci-deployer'])   # system:masters / viewer 제외
+
+    def test_evaluate_emits_rbac_findings_with_severity(self):
+        from src.reports import _report_evaluate
+        risky = self._mgr().get_rbac_risky_subjects()
+        findings = _report_evaluate({'rbac_risky': risky})
+        rbac = [f for f in findings if f['category'] == 'rbac']
+        self.assertEqual(len(rbac), 2)
+        by_name = {f['name']: f for f in rbac}
+        # ServiceAccount 가 cluster-admin → critical
+        self.assertEqual(by_name['ServiceAccount/ci-deployer']['severity'], 'critical')
+        self.assertEqual(by_name['User/alice']['severity'], 'high')
+
+    def test_no_risky_no_findings(self):
+        from src.reports import _report_evaluate
+        findings = _report_evaluate({})
+        self.assertEqual([f for f in findings if f['category'] == 'rbac'], [])
+
+    def test_method_exists(self):
+        from src.k8s import K8sManager
+        self.assertTrue(callable(getattr(K8sManager(), 'get_rbac_risky_subjects', None)))
+
+
 class K9sLaunchTests(unittest.TestCase):
     def test_k9s_launch_command_uses_windows_terminal_when_available(self):
         original_find = polaris._find_windows_terminal
@@ -413,13 +734,70 @@ class K9sLaunchTests(unittest.TestCase):
         self.assertIn(r'C:\Users\me\.kube\prod.yaml', cmd)
 
 
+class OptionalPluginDiscoveryTests(unittest.TestCase):
+    """옵셔널 plugin 자동 발견 메커니즘 회귀 테스트.
+
+    v1.0.10 버그: _discover_optional_mixins 가 glob('*.py') 에만 의존했는데
+    PyInstaller frozen EXE 는 .py 를 PYZ 아카이브에 패킹하므로 glob 이 빈
+    목록을 반환 → plugin 미발견 → 앱 카탈로그 'n[e] is not a function'.
+    v1.0.11 수정: pkgutil.iter_modules 를 우선 사용해 frozen 에서도 동작.
+    """
+
+    def test_discovery_independent_of_filesystem_glob(self):
+        # frozen EXE 시뮬레이션: glob('*.py') 가 아무 파일도 못 찾아도
+        # pkgutil.iter_modules 만으로 동일한 plugin 집합을 발견해야 한다.
+        # (catalog 가 제거된 variant 빌드에서는 양쪽 다 빈 집합 → 여전히 일치)
+        from unittest import mock
+        import src.api as api_pkg
+
+        baseline = {fid for fid, _ in api_pkg._discover_optional_mixins()}
+        with mock.patch.object(Path, 'glob', return_value=()):
+            frozen_like = {fid for fid, _ in api_pkg._discover_optional_mixins()}
+
+        self.assertEqual(
+            baseline, frozen_like,
+            'glob 없이(frozen EXE) plugin 발견 결과가 달라짐 — '
+            'pkgutil.iter_modules 경로가 동작하지 않음',
+        )
+
+    def test_enabled_features_reflect_discovery(self):
+        # ENABLED_FEATURES 는 발견된 옵셔널 plugin id 와 일치해야 한다.
+        import src.api as api_pkg
+        discovered = tuple(fid for fid, _ in api_pkg._discover_optional_mixins())
+        self.assertEqual(api_pkg.ENABLED_FEATURES, discovered)
+        # 발견된 각 plugin 의 메서드가 PolarisAPI 에 실제로 합성됐는지 확인.
+        if 'catalog' in api_pkg.ENABLED_FEATURES:
+            self.assertTrue(hasattr(api_pkg.PolarisAPI, 'get_catalog'))
+
+
 class AppLifecycleTests(unittest.TestCase):
     def test_app_uses_polaris_runtime_identity(self):
-        self.assertEqual(polaris.VERSION, '1.0.10-e2')
+        # 패치 버전은 작업마다 자동으로 오르고, variant 빌드는 -eN 접미사를 붙이므로
+        # 정확한 패치 숫자 대신 형식(major.minor.patch[-variant])을 검증한다.
+        self.assertRegex(polaris.VERSION, r'^\d+\.\d+\.\d+(-[a-zA-Z0-9]+)?$')
         self.assertIn('.polaris', str(polaris.PolarisAPI._SESSION_PATH))
         self.assertIn('.polaris', str(polaris.PolarisAPI._SETTINGS_PATH))
         self.assertEqual(polaris._WT_SCHEME_NAME, 'Polaris')
         self.assertIn(b'POLARIS', polaris._INSTANCE_SIGNAL)
+
+    def test_selfcheck_reports_infra_api_surface_when_enabled(self):
+        # variant 빌드(polaris-free 등 infra 제거)에서는 건너뜀
+        from src.api import ENABLED_FEATURES
+        if 'infra' not in ENABLED_FEATURES:
+            self.skipTest('infra plugin 미포함 (variant 빌드)')
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = polaris._selfcheck()
+
+        self.assertEqual(rc, 0)
+        report = json.loads(buf.getvalue())
+
+        self.assertIn('infra', report['enabled_features'])
+        for method in ('vault_status', 'list_servers', 'start_ssh_session'):
+            self.assertTrue(report['api_methods'].get(method), method)
+        self.assertTrue(report['infra_dependencies']['cryptography'])
+        self.assertTrue(report['infra_dependencies']['paramiko'])
 
     def test_settings_persist_known_theme_id(self):
         original_settings_path = polaris.PolarisAPI._SETTINGS_PATH
@@ -645,6 +1023,29 @@ class BuildToolSelectionTests(unittest.TestCase):
 
             self.assertEqual(path.read_bytes(), b'<html>\n<body></body>\n</html>\n')
 
+    def test_detects_missing_direct_node_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui_dir = Path(tmp)
+            (ui_dir / 'package.json').write_text(
+                json.dumps({
+                    'dependencies': {
+                        '@xterm/xterm': '^6.0.0',
+                        'react': '^18.0.0',
+                    },
+                    'devDependencies': {
+                        'vite': '^8.0.0',
+                    },
+                }),
+                encoding='utf-8',
+            )
+            (ui_dir / 'node_modules' / 'react').mkdir(parents=True)
+
+            missing = build._missing_node_modules_dependencies(ui_dir)
+
+        self.assertIn('@xterm/xterm', missing)
+        self.assertIn('vite', missing)
+        self.assertNotIn('react', missing)
+
     def test_reports_missing_pyinstaller_runtime_dependencies(self):
         available = {'docx', 'PyInstaller'}
         checker = getattr(build, '_missing_runtime_imports', None)
@@ -659,6 +1060,8 @@ class BuildToolSelectionTests(unittest.TestCase):
         self.assertIn(('webview', 'pywebview'), missing)
         self.assertIn(('pystray', 'pystray'), missing)
         self.assertIn(('PIL', 'Pillow'), missing)
+        self.assertIn(('cryptography', 'cryptography'), missing)
+        self.assertIn(('paramiko', 'paramiko'), missing)
         self.assertNotIn(('docx', 'python-docx'), missing)
         self.assertNotIn(('PyInstaller', 'pyinstaller'), missing)
 
