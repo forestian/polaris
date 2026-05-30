@@ -1,0 +1,4 @@
+# 체크섬 파일은 LF 로 고정해야 다운로드 후 `sha256sum -c` 가 동작한다
+# (CRLF 면 파일명이 'polaris.exe\r' 로 파싱돼 FAILED).
+*.sha256 -text
+*.sha512 -text
