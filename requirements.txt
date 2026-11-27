@@ -3,7 +3,7 @@
 # 설치돼 있었음 — 하한 미충족 드리프트를 아무도 눈치 못 채고 있었던 사례). 간접 의존성(bcrypt,
 # cffi, PyNaCl 등)은 핀 고정하지 않음 — 별도 락파일(pip-compile) 도입은 더 큰 프로세스 변경이라
 # 이번엔 직접 의존성만 고정. 버전 올릴 땐 이 파일을 의도적으로 갱신.
-kubernetes==35.0.0
+kubernetes==37.0.3
 pywebview==6.2.1
 python-docx==1.2.0
 pyinstaller==6.20.0
