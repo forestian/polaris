@@ -6,7 +6,7 @@
 kubernetes==35.0.0
 pywebview==6.2.1
 python-docx==1.2.0
-pyinstaller==6.20.0
+pyinstaller==6.22.3
 pystray==0.19.5
 Pillow==12.1.1
 cryptography==48.0.0
