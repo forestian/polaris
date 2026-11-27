@@ -40,7 +40,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ui
-        run: npm ci
+        run: npm install --no-audit --no-fund   # npm ci 는 Linux 전용 선택 패키지(@emnapi) 차이로 거부한다
 
       - name: Build
         working-directory: ui
