@@ -21,7 +21,7 @@
     "@xterm/xterm": "^6.0.0",
     "codemirror": "^6.0.2",
     "js-yaml": "^4.2.0",
-    "lucide-react": "^0.441.0",
+    "lucide-react": "^1.79.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
