@@ -1,9 +1,25 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react'
 import { api } from './api.js'
-import { applyTheme, normalizeThemeId } from './themeRegistry.js'
+import { shouldSilentUnlock } from './vaultGate.js'
+import { applyTheme, normalizeThemeId, installThemeStyles } from './themeRegistry.js'
+import { normalizeCustom } from './customTheme.js'
 import { normalizeEnabledFeaturesResponse } from './featureGate.js'
 
 const AppContext = createContext(null)
+
+// Provider value 는 (수정 전) 매 렌더 새 객체(60+ 필드)라, useApp() 을 쓰는 ~40개 소비자 전체가
+// 자신과 무관한 상태 변화(예: 다른 탭에서 진행 중인 설치 job 의 1~2초 폴링)에도 함께 리렌더됐다.
+// 필드가 많아 손으로 useMemo dependency 배열을 나열하면 하나만 빠뜨려도 그 필드가 stale 값에
+// 갇히는 버그가 생기므로, 대신 얕은 비교로 실제 값이 하나라도 바뀐 필드가 있을 때만 새 참조를
+// 반환한다(전부 그대로면 이전 객체 참조를 그대로 재사용 → React 가 리렌더 스킵).
+function useStableProviderValue(obj) {
+  const ref = useRef(obj)
+  const prev = ref.current
+  const keys = Object.keys(obj)
+  const changed = keys.length !== Object.keys(prev).length || keys.some(k => obj[k] !== prev[k])
+  if (changed) ref.current = obj
+  return ref.current
+}
 
 export function AppProvider({ children }) {
   // ── 멀티클러스터 상태 ──────────────────────────────────────────────────────
@@ -29,14 +45,15 @@ export function AppProvider({ children }) {
   const [activeResource, setActiveResource] = useState(null)
   const [showConnect, setShowConnect] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [settingsTab, setSettingsTab] = useState(null)   // 설정을 특정 탭으로 열 때 (v1.3.50)
   const [logTarget,  setLogTarget]    = useState(null)
   const [terminalCommand, setTerminalCommand] = useState('')
 
-  // ── 앱 모드 (v1.1.0) — 'k8s' | 'ssh' ──────────────────────────────────
+  // ── 앱 모드 — 'k8s' | 'check' ──────────────────────────────────────────
   // 모드 전환 시 사이드바 / 상단 탭 / 페이지 라우팅 모두 교체됨.
   const [appMode, _setAppMode] = useState('k8s')
-  // SSH 모드 상태
-  const [sshActivePage, setSshActivePage] = useState('servers')   // servers|install|terminal
+  // CHECK 모드 — 클러스터 스캔 · 업그레이드 사전 점검 · 클러스터 보고서. 목록은 checkPages.js
+  const [checkActivePage, setCheckActivePage] = useState('health')
 
   // ── Vault (v1.2.1 — 코어 보안) ────────────────────────────────────────────
   // available: cryptography 사용 가능 여부 (false 면 게이트 우회 = 평문 동작)
@@ -44,6 +61,8 @@ export function AppProvider({ children }) {
   const [vaultStatus, setVaultStatus] = useState({ exists: false, unlocked: false, available: true, has_dpapi: false })
   const [vaultChecked, setVaultChecked] = useState(false)   // 최초 부팅 시퀀스(자동해제 포함) 완료 여부
   const [showVaultPanel, setShowVaultPanel] = useState(false) // 좌하단 박스 클릭 시 보안 보관함 패널
+  // 사용자가 직접 '잠그기'를 눌렀는지 (Win+L 식 잠금화면 표시 트리거). 시작 시 로그인과 구분.
+  const [vaultLockedByUser, setVaultLockedByUser] = useState(false)
 
   // vault 잠금 해제 간주 조건: 실제 unlock 됐거나 vault 가 비활성(평문 빌드)일 때
   const vaultUnlocked = vaultStatus.unlocked === true || vaultStatus.available === false
@@ -80,17 +99,27 @@ export function AppProvider({ children }) {
 
   const vaultUnlock = useCallback(async (pw) => {
     const r = await api.vaultUnlock(pw)
+    if (r?.ok) setVaultLockedByUser(false)
     await refreshVaultStatus()
     return r
   }, [refreshVaultStatus])
 
   const vaultUnlockDpapi = useCallback(async () => {
     const r = await api.vaultUnlockDpapi()
+    if (r?.ok) setVaultLockedByUser(false)
+    await refreshVaultStatus()
+    return r
+  }, [refreshVaultStatus])
+
+  const vaultUnlockHello = useCallback(async () => {
+    const r = await api.vaultUnlockHello()
+    if (r?.ok) setVaultLockedByUser(false)
     await refreshVaultStatus()
     return r
   }, [refreshVaultStatus])
 
   const vaultLock = useCallback(async () => {
+    setVaultLockedByUser(true)   // 수동 잠금 → 잠금화면(자물쇠) 표시
     const r = await api.vaultLock()
     await refreshVaultStatus()
     return r
@@ -108,7 +137,7 @@ export function AppProvider({ children }) {
   }, [refreshVaultStatus])
 
   const setAppMode = useCallback((mode) => {
-    if (mode !== 'k8s' && mode !== 'ssh') return
+    if (!['k8s', 'check'].includes(mode)) return
     _setAppMode(mode)
   }, [])
 
@@ -121,6 +150,8 @@ export function AppProvider({ children }) {
     closeBehavior: 'tray',  // 'tray' | 'exit'
     autoRestore:   true,
     themeId:       'polaris',
+    customTheme:   {},      // 커스텀 테마 색 (themeId==='custom' 일 때 쓰임)
+    notifications: {},      // 이벤트→트레이/웹훅 알림
   })
 
   // ── 세션 영속화 (v3.7.3) ─────────────────────────────────────────────────
@@ -130,6 +161,13 @@ export function AppProvider({ children }) {
 
   // 활성 옵셔널 플러그인 목록 (v1.1.0) — UI 게이팅용
   const [enabledFeatures, setEnabledFeatures] = useState(null)
+
+  // 설정에서 기능을 켜고 끈 직후 상단 탭이 바로 바뀌게 — 재시작 없이. (v1.3.16)
+  const refreshEnabledFeatures = useCallback(async () => {
+    const r = await api.getEnabledFeatures()
+    const features = normalizeEnabledFeaturesResponse(r)
+    if (features !== null) setEnabledFeatures(features)
+  }, [])
 
   // ── 앱 버전 + features 로드 ─────────────────────────────────────────────
   useEffect(() => {
@@ -185,8 +223,16 @@ export function AppProvider({ children }) {
     async function boot() {
       if (cancelled) return
       const s = await refreshVaultStatus()
-      // 자동 잠금 해제(DPAPI) 모드 + 아직 잠김 → 비밀번호 없이 해제 시도
-      if (!cancelled && s.available && s.exists && s.has_dpapi && !s.unlocked) {
+      // 자동 잠금 해제(DPAPI) 모드 + 아직 잠김 → 비밀번호 없이 해제 시도.
+      // 단, Windows Hello 요구(v1.2.167)가 켜져 있으면 **조용히 열지 않는다** —
+      // 사람 확인을 세우려고 켠 설정인데 부팅 때 그냥 열리면 의미가 없다.
+      // 판단은 shouldSilentUnlock() 에 모아 뒀다 (vaultGate.test.mjs 로 고정).
+      const dpapiCandidate = s.available && s.exists && s.has_dpapi && !s.unlocked
+      let hello = null
+      if (!cancelled && dpapiCandidate) {
+        try { hello = await api.helloStatus() } catch { hello = null }
+      }
+      if (!cancelled && shouldSilentUnlock(s, hello)) {
         try {
           const r = await api.vaultUnlockDpapi()
           if (!cancelled && r?.ok) await refreshVaultStatus()
@@ -249,9 +295,12 @@ export function AppProvider({ children }) {
     return merged
   }, [settings])
 
+  // 커스텀 색이 바뀌면 <style> 블록을 다시 심고 나서 테마를 적용한다.
+  // 순서가 반대면 방금 고른 색이 **한 박자 늦게** 반영된다.
   useEffect(() => {
+    installThemeStyles(undefined, normalizeCustom(settings.customTheme))
     applyTheme(settings.themeId)
-  }, [settings.themeId])
+  }, [settings.themeId, settings.customTheme])
 
   // ── 클러스터 목록 갱신 ────────────────────────────────────────────────────
   // 백엔드에서 가져온 목록과 프론트엔드 전용 필드(lastPage, lastNamespace)를 병합
@@ -274,6 +323,14 @@ export function AppProvider({ children }) {
     } catch {}
   }, [])
 
+  // 네임스페이스 목록 재조회 — 클러스터 변경 외에도 리소스 화면 진입 시 호출.
+  const refreshNamespaces = useCallback(() => {
+    if (!connected) return
+    api.getNamespaces()
+      .then(ns => setNamespaces(['All Namespaces', ...(ns || [])]))
+      .catch(() => {})
+  }, [connected])
+
   // ── 활성 클러스터 변경 시 네임스페이스 목록 갱신 ──────────────────────────
   useEffect(() => {
     if (!connected) {
@@ -281,15 +338,8 @@ export function AppProvider({ children }) {
       _setNamespace('All Namespaces')
       return
     }
-    api.getNamespaces()
-      .then(ns => setNamespaces(['All Namespaces', ...(ns || [])]))
-      .catch(() => {})
-  }, [activeClusterId, connected])
-
-  // ── refreshStatus (기존 호환) ─────────────────────────────────────────────
-  const refreshStatus = useCallback(async () => {
-    await refreshClusters()
-  }, [refreshClusters])
+    refreshNamespaces()
+  }, [activeClusterId, connected, refreshNamespaces])
 
   // ── 네임스페이스 변경 — 현재 클러스터에 lastNamespace 저장 ────────────────
   const setNamespace = useCallback((ns) => {
@@ -385,13 +435,18 @@ export function AppProvider({ children }) {
   const renameCluster = useCallback(async (id, name) => {
     const result = await api.renameCluster(id, name)
     if (result?.ok) {
-      // display_name만 업데이트, lastPage/lastNamespace 보존
-      setClusters(prev => prev.map(c =>
-        c.id === id ? { ...c, display_name: name } : c
-      ))
+      // display_name 업데이트 + vault 보관 키(kc_name) 동기화 (백엔드가 vault 항목도 이전)
+      // → 같은 보관본을 가리키던 다른 탭들의 kc_name 도 함께 갱신(세션 복원 댕글링 방지)
+      const oldKc = clusters.find(c => c.id === id)?.kc_name
+      const newKc = result.kc_name
+      setClusters(prev => prev.map(c => {
+        if (c.id === id) return { ...c, display_name: name, kc_name: newKc ?? c.kc_name }
+        if (newKc && oldKc && c.kc_name === oldKc) return { ...c, kc_name: newKc }
+        return c
+      }))
     }
     return result
-  }, [])
+  }, [clusters])
 
   // ── 세션 자동 저장 (debounced 500ms) ─────────────────────────────────────
   // clusters · activeClusterId · activePage · namespace 변경 시 자동 호출
@@ -434,6 +489,10 @@ export function AppProvider({ children }) {
             closeBehavior: s.closeBehavior === 'exit' ? 'exit' : 'tray',
             autoRestore:   s.autoRestore !== false,
             themeId:       normalizeThemeId(s.themeId),
+            customTheme:   normalizeCustom(s.customTheme),
+            // 빠뜨리면 재시작 뒤 테마 · 글꼴만 바꿔 저장해도 웹훅 주소 · 알림 켜기가 지워졌다(v1.4.24) —
+            // 저장은 이 객체를 통째로 보내고 백엔드는 없는 키를 기본값으로 채운다
+            notifications: (s.notifications && typeof s.notifications === 'object') ? s.notifications : {},
           }
           setSettingsState(activeSettings)
         }
@@ -537,43 +596,46 @@ export function AppProvider({ children }) {
     }
   }, [refreshClusters, vaultUnlocked])
 
+  const value = useStableProviderValue({
+    // 멀티클러스터
+    clusters, activeClusterId, clusterSwitchKey,
+    addCluster, connectFromVault, removeCluster, switchCluster, renameCluster,
+    refreshClusters,
+
+    // 기존 호환 파생 상태
+    connected, kubeVersion, clusterName,
+
+    // 기존 상태
+    appVersion,
+    namespace, setNamespace,
+    namespaces, setNamespaces, refreshNamespaces,
+    activePage, activeResource,
+    navigate,
+    showConnect, setShowConnect,
+    showSettings, setShowSettings,
+    settingsTab, setSettingsTab,
+    logTarget, setLogTarget,
+    terminalCommand, setTerminalCommand,
+
+    // 가시성 & 설정 (v3.7.11)
+    windowVisible,
+    settings, saveSettings,
+
+    // 앱 모드 (v1.1.0)
+    appMode, setAppMode,
+    checkActivePage, setCheckActivePage,
+    enabledFeatures, refreshEnabledFeatures,
+
+    // Vault (v1.2.1~)
+    vaultStatus, vaultChecked, vaultUnlocked, refreshVaultStatus,
+    vaultInit, vaultUnlock, vaultUnlockDpapi, vaultUnlockHello, vaultLock,
+    vaultChangePassword, vaultSetAutoUnlock,
+    showVaultPanel, setShowVaultPanel,
+    vaultLockedByUser,
+  })
+
   return (
-    <AppContext.Provider value={{
-      // 멀티클러스터
-      clusters, activeClusterId, clusterSwitchKey,
-      addCluster, connectFromVault, removeCluster, switchCluster, renameCluster,
-      refreshClusters,
-
-      // 기존 호환 파생 상태
-      connected, kubeVersion, clusterName,
-
-      // 기존 상태
-      appVersion,
-      namespace, setNamespace,
-      namespaces, setNamespaces,
-      activePage, activeResource,
-      navigate,
-      showConnect, setShowConnect,
-      showSettings, setShowSettings,
-      logTarget, setLogTarget,
-      terminalCommand, setTerminalCommand,
-      refreshStatus,
-
-      // 가시성 & 설정 (v3.7.11)
-      windowVisible,
-      settings, saveSettings,
-
-      // 앱 모드 (v1.1.0)
-      appMode, setAppMode,
-      sshActivePage, setSshActivePage,
-      enabledFeatures,
-
-      // Vault (v1.2.1~)
-      vaultStatus, vaultChecked, vaultUnlocked, refreshVaultStatus,
-      vaultInit, vaultUnlock, vaultUnlockDpapi, vaultLock,
-      vaultChangePassword, vaultSetAutoUnlock,
-      showVaultPanel, setShowVaultPanel,
-    }}>
+    <AppContext.Provider value={value}>
       {children}
     </AppContext.Provider>
   )
@@ -584,3 +646,5 @@ export function useApp() {
   if (!ctx) throw new Error('useApp must be inside AppProvider')
   return ctx
 }
+
+

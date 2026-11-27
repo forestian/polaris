@@ -1,0 +1,29 @@
+[package]
+name = "polaris-setup"
+version = "1.5.74-f1"
+description = "Polaris Windows 설치 마법사"
+authors = ["Polaris contributors"]
+edition = "2021"
+
+# 설치기 자체가 최종 산출물(target/release/polaris-setup.exe). bundle 비활성.
+# 한글 경로에서 MinGW(dlltool/ld)가 실패하므로 ASCII 경로에서 빌드할 것.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# zip 2.x~9.0.2 는 crates.io 에서 전부 회수(yanked)됐다(2026-10). 9.0.3 이상만 받는다.
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+rfd = "0.15"
+winreg = "0.52"
+mslnk = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

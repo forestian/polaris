@@ -25,9 +25,7 @@ export default function HelmPage() {
     try {
       const data = await api.getHelmReleases()
       setRows(Array.isArray(data) ? data : [])
-    } catch {
-      setRows([])
-    }
+    } catch { setRows([]) }
     setLoading(false)
   }
 
@@ -44,10 +42,8 @@ export default function HelmPage() {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {/* 헤더 */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 10,
-        padding: '10px 16px',
-        borderBottom: '1px solid var(--border)',
-        background: 'var(--bg-1)', flexShrink: 0,
+        display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px',
+        borderBottom: '1px solid var(--border)', background: 'var(--bg-1)', flexShrink: 0,
       }}>
         <Package size={15} color="var(--nimbus)" />
         <h1 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-bright)', margin: 0 }}>

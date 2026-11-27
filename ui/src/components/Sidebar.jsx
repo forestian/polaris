@@ -1,11 +1,11 @@
 import React, { useState } from 'react'
 import { useApp } from '../store.jsx'
-import { isFeatureEnabled } from '../featureGate.js'
 import {
   LayoutDashboard, Network, Box, Layers, Globe, Database,
   Package, GitBranch, Terminal, Monitor, ChevronDown, ChevronRight,
   Server, Cpu, HardDrive, Shield, FileText, ScrollText, Activity,
-  AppWindow, Cable, Boxes, KeyRound, Camera, Lock, Unlock, ChevronUp,
+  AppWindow, Cable, Boxes, KeyRound, Camera, Lock, Unlock, ChevronUp, Archive, ArrowRightLeft,
+  HeartPulse, Wrench, FlaskConical,
 } from 'lucide-react'
 
 const TREE = [
@@ -75,30 +75,32 @@ const TREE = [
   },
 ]
 
+// 상단 고정 — 매 세션 항상 보이는 핵심 진입점만. 나머지는 아래 TOOL_PAGES(접이식 '도구' 그룹)로.
 const TOP_PAGES = [
-  { id: 'dashboard', label: '대시보드',      icon: LayoutDashboard },
+  { id: 'dashboard', label: '대시보드', icon: LayoutDashboard },
+]
+
+// 도구 모음 — 자주 쓰지 않는 기능들. 리소스 트리 공간을 지키기 위해 기본 접힘 상태의
+// 단일 그룹으로 묶는다(v1.2.111). 페이지가 늘어나도 여기에 추가하면 트리 공간은 그대로.
+const TOOL_PAGES = [
+  { id: 'multicluster', label: '멀티클러스터', icon: Layers },
   { id: 'topology',  label: '토폴로지',      icon: Globe },
   { id: 'events',    label: '이벤트',        icon: Activity },
   { id: 'snapshots', label: '스냅샷',        icon: Camera },
-  { id: 'report',    label: '보고서',        icon: FileText },
-  { id: 'catalog',   label: '앱 카탈로그',   icon: AppWindow },
+  { id: 'yamllab',   label: 'YAML 실험실',   icon: FlaskConical },
   { id: 'logs',      label: '로그뷰어',      icon: ScrollText },
   { id: 'portforward', label: '포트포워딩', icon: Cable },
   { id: 'k9s',       label: 'k9s',          icon: Monitor },
   { id: 'terminal',  label: 'kubectl 터미널', icon: Terminal },
 ]
 
-// catalog 플러그인이 이 빌드에 포함됐는지 (무료빌드는 CatalogPage 삭제 → 메뉴 자동 숨김)
-const _CATALOG_PRESENT = !!import.meta.glob('../pages/CatalogPage.jsx', { eager: false })['../pages/CatalogPage.jsx']
-
 export default function Sidebar() {
   const { activePage, activeResource, navigate, connected, clusterName, kubeVersion,
-          vaultStatus, setShowVaultPanel, enabledFeatures } = useApp()
-  const [collapsed, setCollapsed] = useState({})
+          vaultStatus, setShowVaultPanel } = useApp()
+  // '도구' 그룹은 기본 접힘 — 리소스 트리가 스크롤 없이 바로 보이도록.
+  const [collapsed, setCollapsed] = useState(() => ({ tools: true }))
 
-  // 앱 카탈로그는 plugin 활성 시에만 노출 (백엔드 enabledFeatures 우선, 미로드 시 번들 여부)
-  const topPages = TOP_PAGES.filter(p =>
-    p.id !== 'catalog' || isFeatureEnabled('catalog', enabledFeatures, _CATALOG_PRESENT))
+  const toolPages = TOOL_PAGES
 
   function toggle(id) {
     setCollapsed(p => ({ ...p, [id]: !p[id] }))
@@ -155,7 +157,7 @@ export default function Sidebar() {
     }}>
       {/* 상단 고정 페이지 */}
       <div style={{ padding: '8px 0 4px' }}>
-        {topPages.map(p => {
+        {TOP_PAGES.map(p => {
           const Icon = p.icon
           const active = activePage === p.id
           return (
@@ -181,6 +183,45 @@ export default function Sidebar() {
 
       {/* 트리 탐색기 */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0' }}>
+        {/* 도구 모음 — 자주 안 쓰는 기능들을 접이식 그룹 하나로. 리소스 그룹과 같은 헤더 스타일,
+            하위 항목은 기존 아이콘을 유지(다양한 기능이라 아이콘으로 빠르게 스캔 가능하게). */}
+        <div>
+          <button onClick={() => toggle('tools')}
+            style={{
+              width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+              padding: '6px 14px', border: 'none', cursor: 'pointer',
+              background: 'transparent', color: 'var(--text-dim)',
+              fontSize: 10.5, fontFamily: 'var(--font)',
+              fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}
+          >
+            {!collapsed.tools ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
+            <Wrench size={11} />
+            <span style={{ flex: 1, textAlign: 'left', color: 'var(--text-mid)' }}>도구</span>
+          </button>
+
+          {!collapsed.tools && toolPages.map(p => {
+            const Icon = p.icon
+            const active = activePage === p.id
+            return (
+              <button key={p.id} onClick={() => navigate(p.id)}
+                style={{
+                  width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '5px 12px 5px 30px', border: 'none',
+                  cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font)',
+                  transition: 'all 0.12s', borderRadius: '0 4px 4px 0', marginLeft: 6,
+                  ...(active ? activeItemStyle : inactiveItemStyle),
+                }}
+                onMouseEnter={e => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.03)' }}
+                onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent' }}
+              >
+                <Icon size={13} color={active ? 'var(--nimbus)' : 'var(--text-dim)'} />
+                {p.label}
+              </button>
+            )
+          })}
+        </div>
+
         {TREE.map(cat => {
           const isOpen = !collapsed[cat.id]
           const CatIcon = cat.icon
@@ -241,7 +282,7 @@ export default function Sidebar() {
   )
 }
 
-// ── 좌하단 클러스터 / 보안 보관함 박스 (K8s · SSH 공통 패턴) ──────────────────
+// ── 좌하단 클러스터 / 보안 보관함 박스 ──────────────────
 export function ClusterVaultBox({ connected, clusterName, kubeVersion, vaultStatus, onOpen }) {
   const unlocked = vaultStatus?.unlocked
   return (
@@ -292,9 +333,11 @@ export function ClusterVaultBox({ connected, clusterName, kubeVersion, vaultStat
             <div style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--text-bright)' }}>
               보안 보관함
             </div>
-            <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
-              {unlocked ? <Unlock size={9} color="var(--nimbus)" /> : <Lock size={9} />}
-              {unlocked ? '잠금 해제됨' : '잠김'} · kubeconfig·접속정보·스냅샷
+            <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 1, display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+              {unlocked ? <Unlock size={9} color="var(--nimbus)" style={{ flexShrink: 0 }} /> : <Lock size={9} style={{ flexShrink: 0 }} />}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+                kubeconfig·접속정보·스냅샷
+              </span>
             </div>
           </div>
           <ChevronUp size={12} color="var(--text-dim)" />

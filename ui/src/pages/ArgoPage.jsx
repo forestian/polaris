@@ -510,7 +510,8 @@ export default function ArgoPage() {
                 fontWeight: active ? 600 : 400,
               }}>
                 <span>{s === 'All' ? '전체' : s}</span>
-                <span style={{ fontSize: 10, opacity: 0.7, fontVariantNumeric: 'tabular-nums' }}>{count}</span>
+                {/* opacity 를 얹으면 버튼 색(nimbus/text-dim) 위에 또 흐려진다 */}
+                <span style={{ fontSize: 10, fontVariantNumeric: 'tabular-nums' }}>{count}</span>
               </button>
             )
           })}
@@ -530,7 +531,7 @@ export default function ArgoPage() {
               fontWeight: !filterProject ? 600 : 400,
             }}>
               <span>전체</span>
-              <span style={{ fontSize: 10, opacity: 0.7 }}>{rows.length}</span>
+              <span style={{ fontSize: 10 }}>{rows.length}</span>
             </button>
             {projects.map(p => {
               const cnt = rows.filter(r => r.project === p).length
@@ -547,7 +548,7 @@ export default function ArgoPage() {
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                 }}>
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p}</span>
-                  <span style={{ fontSize: 10, opacity: 0.7, flexShrink: 0, marginLeft: 4 }}>{cnt}</span>
+                  <span style={{ fontSize: 10, flexShrink: 0, marginLeft: 4 }}>{cnt}</span>
                 </button>
               )
             })}

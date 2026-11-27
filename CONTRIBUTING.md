@@ -30,9 +30,9 @@ python polaris.py
 ## Building the EXE
 
 ```bash
-# Validates VERSION / CHANGELOG sync, builds UI, runs PyInstaller
+# Validates VERSION / CHANGELOG sync, runs guard tests, builds UI, PyInstaller and the Tauri installer
 python build.py
-# → dist/polaris.exe
+# → dist/polaris-setup-win64.exe (installer; the app itself is dist/polaris/)
 ```
 
 Requires all entries in `requirements.txt` to be installed, including PyInstaller.

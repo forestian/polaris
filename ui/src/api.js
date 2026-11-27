@@ -39,8 +39,20 @@ export const api = {
   getAppVersion:        ()              => call('get_app_version'),
   getEnabledFeatures:   ()              => callSafe('get_enabled_features'),
 
+  // 창 컨트롤 (frameless 커스텀 타이틀바)
+  windowMinimize:       ()              => callSafe('window_minimize'),
+  windowToggleMaximize: ()              => callSafe('window_toggle_maximize'),
+  windowClose:          ()              => callSafe('window_close'),
+  windowGetBounds:      ()              => callSafe('window_get_bounds'),
+  windowSetBounds:      (x, y, w, h)    => callSafe('window_set_bounds', x, y, w, h),
+  // 제목표시줄 드래그 시작 — 최대화 상태면 복원하고 잡은 지점을 돌려준다 (v1.2.151)
+  windowDragBegin:      (sx, sy)        => callSafe('window_drag_begin', sx, sy),
+  // 보고서 기본 파일명 (클러스터 별명 포함) — v1.2.154
+  defaultReportFilename: ()             => callSafe('default_report_filename'),
+
   // 멀티클러스터 관리 (v3.7.0)
   getClusters:            ()                   => call('get_clusters'),
+  getMulticlusterSummary: ()                   => callSafe('get_multicluster_summary'),
   addCluster:             (path, context=null) => call('add_cluster', path, context),
   addClusterFromVault:    (kcName, context=null) => callSafe('add_cluster_from_vault', kcName, context),
   listKubeconfigContexts: (path)               => callSafe('list_kubeconfig_contexts', path),
@@ -56,6 +68,7 @@ export const api = {
   // 앱 설정 (v3.7.11) — closeBehavior, autoRestore
   getSettings:       ()              => callSafe('get_settings'),
   saveSettings:      (state)         => callSafe('save_settings', state),
+  testWebhook:       (url)           => callSafe('test_webhook', url),
 
   // 데이터 디렉터리 위치 (v1.2.2)
   getDataDir:        ()              => callSafe('get_data_dir'),
@@ -83,12 +96,21 @@ export const api = {
 
   // 리소스 브라우저
   getResource:       (type, ns)      => call('get_resource', type, ns),
+  // 리소스 실시간 갱신 (watch API) — v1: pods 만 지원
+  resourceWatchKinds:  ()                       => callSafe('resource_watch_kinds'),
+  startResourceWatch:  (kind, ns='')            => callSafe('start_resource_watch', kind, ns),
+  recvResourceWatch:   (watchId)                => callSafe('recv_resource_watch', watchId),
+  stopResourceWatch:   (watchId)                => callSafe('stop_resource_watch', watchId),
   deleteResource:    (kind, ns, name)=> call('delete_resource', kind, ns, name),
 
   // 리소스 쓰기 (YAML apply / scale / rollout restart)
   applyResourceYaml: (yamlText, kind='') => callSafe('apply_resource_yaml', yamlText, kind),
+  validateResourceYaml: (yamlText) => callSafe('validate_resource_yaml', yamlText),
+  patchResource:     (kind, ns, name, patch) => callSafe('patch_resource', kind, ns, name, patch),
   scaleResource:     (kind, ns, name, replicas) => callSafe('scale_resource', kind, ns, name, replicas),
   rolloutRestart:    (kind, ns, name) => callSafe('rollout_restart', kind, ns, name),
+  getRolloutRevisions: (kind, ns, name)          => callSafe('get_rollout_revisions', kind, ns, name),
+  rolloutUndo:         (kind, ns, name, revision) => callSafe('rollout_undo', kind, ns, name, revision),
 
   // CRD 자동 발견
   getCrds:           ()                => callSafe('get_crds'),
@@ -116,11 +138,19 @@ export const api = {
   deleteArgoApp:     (ns, name)      => call('delete_argocd_app', ns, name),
 
   // Helm
-  getHelmReleases:   ()              => call('get_helm_releases'),
+  getHelmReleases:     ()                  => call('get_helm_releases'),
 
   // kubectl 터미널
   runKubectl:        (cmd)           => call('run_kubectl', cmd),
   openPodShell:      (ns, name, ctr) => call('open_pod_shell', ns, name, ctr),
+  // 내장 파드 exec 셸 (WebSocket 스트림, xterm.js)
+  startPodExec:      (ns, name, ctr='', shell='', cols=80, rows=24) =>
+                       callSafe('start_pod_exec', ns, name, ctr, shell, cols, rows),
+  recvPodExec:       (sessionId)     => callSafe('recv_pod_exec', sessionId),
+  getPodExecSnapshot:(sessionId)     => callSafe('get_pod_exec_snapshot', sessionId),
+  sendPodExec:       (sessionId, data) => callSafe('send_pod_exec', sessionId, data),
+  resizePodExec:     (sessionId, cols, rows) => callSafe('resize_pod_exec', sessionId, cols, rows),
+  closePodExec:      (sessionId)     => callSafe('close_pod_exec', sessionId),
   getPortForwardTargets: (ns)        => callSafe('get_port_forward_targets', ns),
   startPortForward:  (kind, ns, name, localPort, remotePort) =>
                        callSafe('start_port_forward', kind, ns, name, localPort, remotePort),
@@ -138,6 +168,42 @@ export const api = {
   generateReport:    (cfg)           => call('generate_report', cfg),
   startReport:       (cfg)           => call('start_report', cfg),
   getJobStatus:      (id)            => call('get_job_status', id),
+  // 규칙 기반 클러스터 스캔 (온디맨드) + 선택적 LLM 설명 + 선택적 네트워크 스캐닝.
+  // positional 호출이므로 새 인자는 반드시 **맨 뒤에** 추가해야 한다(중간 삽입 시 오결합).
+  healthScan:        (explain=false, llmUrl='', llmModel='local-model', netscan=false) =>
+                       callSafe('health_scan', explain, llmUrl, llmModel, netscan),
+
+  // CHECK 탭 업그레이드 사전 점검 (v1.4.1)
+  upgradeCheckVersions: ()                 => callSafe('upgrade_check_versions'),
+  upgradeCheck:         (target)           => callSafe('upgrade_check', target),
+  upgradeCheckSave:     (path)             => callSafe('upgrade_check_save', path),
+  upgradeCheckFilename: ()                 => callSafe('upgrade_check_filename'),
+
+  // YAML 실험실 — 매니페스트 저장/버전/적용/파급관찰/반출.
+  // GitLab 연동은 의도적으로 없다(클러스터마다 저장소가 달라 대상이 하나로 안 정해짐).
+  labList:           (query='')                  => callSafe('lab_list', query),
+  labGet:            (mid)                       => callSafe('lab_get', mid),
+  labSave:           (mid, name, content, tags='', notes='') =>
+                       callSafe('lab_save', mid, name, content, tags, notes),
+  labDelete:         (mid)                       => callSafe('lab_delete', mid),
+  labVersionDiff:    (va, vb)                    => callSafe('lab_version_diff', va, vb),
+  labPreview:        (content)                   => callSafe('lab_preview', content),
+  labApply:          (mid, content, watchS=40)   => callSafe('lab_apply', mid, content, watchS),
+  labApplyStatus:    (jobId)                     => callSafe('lab_apply_status', jobId),
+  labApplyCancel:    (jobId)                     => callSafe('lab_apply_cancel', jobId),
+  labTeardown:       (mid, content='')           => callSafe('lab_teardown', mid, content),
+  labExportText:     (ids)                       => callSafe('lab_export_text', ids),
+  labExportFolder:   (ids, byCluster=true)       => callSafe('lab_export_folder', ids, byCluster),
+
+  // AIOps — LLM 진단 (이벤트/로그). source: 'events' | 'logs'
+  aiDiagnose:        (source, payload, llmUrl, llmModel, question = '') =>
+                       callSafe('ai_diagnose', source, payload, llmUrl, llmModel, question),
+  // AIOps — 멀티턴 후속 질문 / 자유 대화. messages: [{role,content}, ...]
+  // system 생략 시 K8s 진단 후속용.
+  aiChat:            (messages, llmUrl, llmModel, system = '') =>
+                       callSafe('ai_chat', messages, llmUrl, llmModel, system),
+  // 로컬 모델 UX — LLM 서버 도달성 확인 + 모델 목록(/v1/models)
+  testLlmConnection: (llmUrl)        => callSafe('test_llm_connection', llmUrl),
 
   // 리소스 상세 패널
   getPodDetail:      (ns, name)             => call('get_pod_detail', ns, name),
@@ -155,29 +221,23 @@ export const api = {
   // 토폴로지 그래프
   getTopologyData: (ns)                           => call('get_topology_data', ns),
 
-  // 앱 카탈로그 (v3.7.13-r1)
-  getCatalog:              ()                                        => callSafe('get_catalog'),
-  detectClusterProfile:    ()                                        => callSafe('detect_cluster_profile'),
-  getCatalogAppValues:     (appId, preset)                           => callSafe('get_catalog_app_values', appId, preset),
-  catalogPreflight:        (appId)                                   => callSafe('catalog_preflight', appId),
-  startCatalogInstall:     (appId, ns, releaseName, valuesYaml)      => callSafe('start_catalog_install', appId, ns, releaseName, valuesYaml),
-  getCatalogInstallStatus: (jobId)                                   => callSafe('get_catalog_install_status', jobId),
-  uninstallCatalogApp:     (releaseName, ns)                         => callSafe('uninstall_catalog_app', releaseName, ns),
-  getInstalledCatalogApps: ()                                        => callSafe('get_installed_catalog_apps'),
-  installHelm:             ()                                        => callSafe('install_helm'),
-
-  // 스택 묶음 설치 (v3.7.13-r7)
-  startStackInstall:       (stackId, preset, appConfigs)            => callSafe('start_stack_install', stackId, preset, appConfigs),
-  getStackInstallStatus:   (jobId)                                  => callSafe('get_stack_install_status', jobId),
-
-  // ── Vault (v1.2.1 — 코어 보안, K8s/SSH 공통) ────────────────────────────
+  // ── Vault (v1.2.1 — 코어 보안) ────────────────────────────────────
   vaultStatus:           ()                          => callSafe('vault_status'),
   vaultInit:             (masterPw, autoUnlock=false) => callSafe('vault_init', masterPw, autoUnlock),
   vaultUnlock:           (masterPw)                  => callSafe('vault_unlock', masterPw),
   vaultUnlockDpapi:      ()                          => callSafe('vault_unlock_dpapi'),
+
+  // Windows Hello (v1.2.167)
+  helloStatus:           ()                          => callSafe('hello_status'),
+  vaultUnlockHello:      ()                          => callSafe('vault_unlock_hello'),
+  vaultSetRequireHello:  (enable)                    => callSafe('vault_set_require_hello', !!enable),
   vaultSetAutoUnlock:    (enable)                    => callSafe('vault_set_auto_unlock', enable),
   vaultLock:             ()                          => callSafe('vault_lock'),
   vaultChangePassword:   (oldPw, newPw)              => callSafe('vault_change_password', oldPw, newPw),
+  // MCP 액세스 토큰 (v1.2.119) — 발급 응답의 token 은 1회성, 저장하지 말 것
+  vaultIssueMcpToken:    (label, scope, days)        => callSafe('vault_issue_mcp_token', label, scope, days),
+  vaultListMcpTokens:    ()                          => callSafe('vault_list_mcp_tokens'),
+  vaultRevokeMcpToken:   (tokenId)                   => callSafe('vault_revoke_mcp_token', tokenId),
   vaultEntries:          ()                          => callSafe('vault_entries'),
 
   // kubeconfig vault 보관 (v1.2.1)
@@ -185,41 +245,8 @@ export const api = {
   listKubeconfigs:       ()                          => callSafe('list_kubeconfigs'),
   getKubeconfig:         (name)                      => callSafe('get_kubeconfig', name),
   deleteKubeconfig:      (name)                      => callSafe('delete_kubeconfig', name),
+  renameKubeconfig:      (oldName, newName)          => call('rename_kubeconfig', oldName, newName),
 
-  // ── infra 플러그인 (v1.1.0) ─────────────────────────────────────────────
+  openThirdPartyNotices: ()                          => callSafe('open_third_party_notices'),   // 오픈소스 고지 (v1.4.19)
 
-  // 서버 인벤토리
-  listServers:           ()                          => callSafe('list_servers'),
-  getServer:             (id)                        => callSafe('get_server', id),
-  addServer:             (payload)                   => callSafe('add_server', payload),
-  updateServer:          (id, patch)                 => callSafe('update_server', id, patch),
-  deleteServer:          (id)                        => callSafe('delete_server', id),
-
-  // 서버 비밀
-  setServerSecret:       (id, kind, value)           => callSafe('set_server_secret', id, kind, value),
-  setServerSecretFromFile:(id, kind, path)           => callSafe('set_server_secret_from_file', id, kind, path),
-  clearServerSecret:     (id, kind)                  => callSafe('clear_server_secret', id, kind),
-  browsePkey:            ()                          => callSafe('browse_pkey'),
-
-  // 연결 테스트
-  testServer:            (id)                        => callSafe('test_server', id),
-  validateServer:        (payload, secrets)          => callSafe('validate_server', payload, secrets),
-
-  // 레시피 (RKE2 등)
-  listRecipes:           ()                          => callSafe('list_recipes'),
-  runRecipe:             (recipe, serverId, options, sudoPw) =>
-                                                        callSafe('run_recipe', recipe, serverId, options, sudoPw),
-  getRecipeJob:          (jobId)                     => callSafe('get_recipe_job', jobId),
-  listRecipeJobs:        ()                          => callSafe('list_recipe_jobs'),
-  cancelRecipeJob:       (jobId)                     => callSafe('cancel_recipe_job', jobId),
-  clearRecipeJob:        (jobId)                     => callSafe('clear_recipe_job', jobId),
-
-  // SSH 터미널 (PTY) 세션
-  startSshSession:       (serverId, cols=80, rows=24) => callSafe('start_ssh_session', serverId, cols, rows),
-  recvSshSession:        (sessionId)                 => callSafe('recv_ssh_session', sessionId),
-  getSshSessionSnapshot: (sessionId)                 => callSafe('get_ssh_session_snapshot', sessionId),
-  sendSshSession:        (sessionId, data)           => callSafe('send_ssh_session', sessionId, data),
-  resizeSshSession:      (sessionId, cols, rows)     => callSafe('resize_ssh_session', sessionId, cols, rows),
-  closeSshSession:       (sessionId)                 => callSafe('close_ssh_session', sessionId),
-  listSshSessions:       ()                          => callSafe('list_ssh_sessions'),
 }

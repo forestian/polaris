@@ -1,0 +1,237 @@
+{
+ "ok": true,
+ "ingresses": [
+  {
+   "name": "shop",
+   "ns": "shop",
+   "id": "ing/shop/shop",
+   "svc_refs": [
+    "web",
+    "api"
+   ],
+   "rules": [
+    {
+     "host": "shop.example.com",
+     "path": "/",
+     "svc": "web"
+    },
+    {
+     "host": "shop.example.com",
+     "path": "/api",
+     "svc": "api"
+    }
+   ],
+   "tls_hosts": [
+    "shop.example.com"
+   ],
+   "class": "nginx"
+  }
+ ],
+ "services": [
+  {
+   "name": "web",
+   "ns": "shop",
+   "sel": {
+    "app": "web"
+   },
+   "type": "ClusterIP",
+   "id": "svc/shop/web",
+   "ports": [
+    "80→8080"
+   ]
+  },
+  {
+   "name": "api",
+   "ns": "shop",
+   "sel": {
+    "app": "api"
+   },
+   "type": "NodePort",
+   "id": "svc/shop/api",
+   "ports": [
+    "443→https",
+    "9090 (노드 30090)"
+   ]
+  }
+ ],
+ "cronjobs": [
+  {
+   "id": "cj/shop/report",
+   "kind": "CronJob",
+   "name": "report",
+   "ns": "shop",
+   "uid": "cj-uid",
+   "schedule": "0 3 * * *"
+  }
+ ],
+ "workloads": [
+  {
+   "kind": "Deployment",
+   "name": "web",
+   "ns": "shop",
+   "sel": {
+    "app": "web"
+   },
+   "crefs": [
+    [
+     "secret",
+     "registry-cred"
+    ],
+    [
+     "configmap",
+     "web-config"
+    ]
+   ],
+   "id": "wl/shop/Deployment/web",
+   "replicas": 2,
+   "images": [
+    "nginx:1.27"
+   ],
+   "total": 2,
+   "running": 2,
+   "ready": 2,
+   "waiting": [],
+   "restarts": 0
+  },
+  {
+   "kind": "Deployment",
+   "name": "api",
+   "ns": "shop",
+   "sel": {
+    "app": "api"
+   },
+   "crefs": [
+    [
+     "secret",
+     "registry-cred"
+    ],
+    [
+     "pvc",
+     "api-data"
+    ]
+   ],
+   "id": "wl/shop/Deployment/api",
+   "replicas": 2,
+   "images": [
+    "shop/api:3.1"
+   ],
+   "total": 2,
+   "running": 2,
+   "ready": 1,
+   "waiting": [
+    "CrashLoopBackOff"
+   ],
+   "restarts": 7
+  },
+  {
+   "kind": "Deployment",
+   "name": "old-worker",
+   "ns": "shop",
+   "sel": {
+    "app": "old"
+   },
+   "crefs": [],
+   "id": "wl/shop/Deployment/old-worker",
+   "replicas": 0,
+   "images": [
+    "shop/worker:1"
+   ],
+   "total": 0,
+   "running": 0,
+   "ready": 0,
+   "waiting": [],
+   "restarts": 0
+  },
+  {
+   "id": "wl/shop/Job/report-28811",
+   "kind": "Job",
+   "name": "report-28811",
+   "ns": "shop",
+   "uid": "report-28811",
+   "owner_uid": "cj-uid",
+   "succeeded": 1,
+   "failed": 0,
+   "active": 0,
+   "completions": 1,
+   "status": "Complete",
+   "sel": {},
+   "crefs": [],
+   "total": 1,
+   "running": 1,
+   "ready": 1,
+   "waiting": [],
+   "restarts": 0
+  }
+ ],
+ "config_nodes": [
+  {
+   "type": "secret",
+   "name": "registry-cred",
+   "ns": "shop",
+   "id": "secret/shop/registry-cred"
+  },
+  {
+   "type": "configmap",
+   "name": "web-config",
+   "ns": "shop",
+   "id": "configmap/shop/web-config"
+  },
+  {
+   "type": "pvc",
+   "name": "api-data",
+   "ns": "shop",
+   "id": "pvc/shop/api-data"
+  }
+ ],
+ "pv_nodes": [
+  {
+   "type": "pv",
+   "name": "pv-001",
+   "ns": "",
+   "id": "pv//pv-001",
+   "status": "Bound"
+  }
+ ],
+ "edges": [
+  {
+   "from": "cj/shop/report",
+   "to": "wl/shop/Job/report-28811"
+  },
+  {
+   "from": "svc/shop/web",
+   "to": "wl/shop/Deployment/web"
+  },
+  {
+   "from": "svc/shop/api",
+   "to": "wl/shop/Deployment/api"
+  },
+  {
+   "from": "ing/shop/shop",
+   "to": "svc/shop/web"
+  },
+  {
+   "from": "ing/shop/shop",
+   "to": "svc/shop/api"
+  },
+  {
+   "from": "wl/shop/Deployment/web",
+   "to": "secret/shop/registry-cred"
+  },
+  {
+   "from": "wl/shop/Deployment/web",
+   "to": "configmap/shop/web-config"
+  },
+  {
+   "from": "wl/shop/Deployment/api",
+   "to": "secret/shop/registry-cred"
+  },
+  {
+   "from": "wl/shop/Deployment/api",
+   "to": "pvc/shop/api-data"
+  },
+  {
+   "from": "pvc/shop/api-data",
+   "to": "pv//pv-001"
+  }
+ ]
+}

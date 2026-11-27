@@ -17,6 +17,11 @@ _log_jobs: dict = {}
 # job_id → 활성 kubectl port-forward 세션 메타
 _port_forward_jobs: dict = {}
 
+# id(int) → {proc, cluster_id} — kubectl 터미널(run_kubectl)에서 사용자가 직접 실행한
+# port-forward/watch 등 백그라운드 스트리밍 프로세스. 전용 UI(port_forward.py)가 관리하는
+# _port_forward_jobs 와 스키마가 달라 별도 dict — 클러스터 재연결/종료 시 함께 정리된다.
+_kubectl_stream_procs: dict = {}
+
 # 추가 plugin (예: 옵셔널 mixin) 이 자기만의 작업 dict 가 필요하면,
 # 해당 plugin 모듈 (src/api/<feature>.py) 안에서 모듈 전역으로 정의하세요.
 # 코어 _state 는 코어 mixin 들이 공유하는 dict 만 보유.

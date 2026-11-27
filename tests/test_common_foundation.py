@@ -12,7 +12,29 @@ if str(ROOT) not in sys.path:
 
 import polaris
 import build
-from scripts import create_releases
+try:
+    from scripts import create_releases
+except ImportError:          # 공개 저장소(GitHub)에는 내부 릴리스 스크립트가 없다
+    create_releases = None
+
+
+_RT = {}
+
+
+def setUpModule():
+    # 창 닫기 · 종료 처리(polaris._handle_window_closing 등)는 앱 로그를 남긴다 — 사용자의 실제
+    # ~/.polaris/logs/app.log 에 테스트 줄이 쌓이지 않게 이 모듈 동안 임시 폴더로 보낸다(v1.4.24)
+    import src.runtime as RT
+    _RT['orig'] = RT.polaris_dir
+    _RT['dir'] = Path(tempfile.mkdtemp(prefix='polaris-runtime-test-'))
+    RT.polaris_dir = lambda: _RT['dir']
+
+
+def tearDownModule():
+    import shutil
+    import src.runtime as RT
+    RT.polaris_dir = _RT['orig']
+    shutil.rmtree(_RT['dir'], ignore_errors=True)
 
 
 class KubectlParsingTests(unittest.TestCase):
@@ -415,6 +437,61 @@ class ResourceWriteArgsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             polaris._build_rollout_restart_args('replicasets', 'ns', 'rs')
 
+    def test_undo_args_basic(self):
+        self.assertEqual(
+            polaris._build_rollout_undo_args('deployment', 'default', 'web', 3),
+            ['-n', 'default', 'rollout', 'undo', 'deployments/web', '--to-revision=3'],
+        )
+
+    def test_undo_args_no_namespace_and_str_revision(self):
+        self.assertEqual(
+            polaris._build_rollout_undo_args('deploy', '', 'api', '5'),
+            ['rollout', 'undo', 'deployments/api', '--to-revision=5'],
+        )
+
+    def test_undo_args_rejects_bad_revision(self):
+        with self.assertRaises(ValueError):
+            polaris._build_rollout_undo_args('deployment', 'ns', 'web', 0)
+        with self.assertRaises(ValueError):
+            polaris._build_rollout_undo_args('deployment', 'ns', 'web', 'abc')
+
+    def test_undo_args_rejects_non_rollbackable_kind(self):
+        with self.assertRaises(ValueError):
+            polaris._build_rollout_undo_args('services', 'ns', 'svc', 1)
+
+    def test_undo_args_statefulset(self):
+        # v1.2.19: StatefulSet 롤백 (ControllerRevision 기반이지만 kubectl 인자는 동일)
+        self.assertEqual(
+            polaris._build_rollout_undo_args('sts', 'db', 'postgres', 2),
+            ['-n', 'db', 'rollout', 'undo', 'statefulsets/postgres', '--to-revision=2'],
+        )
+
+    def test_undo_args_daemonset(self):
+        # v1.2.19: DaemonSet 롤백
+        self.assertEqual(
+            polaris._build_rollout_undo_args('daemonset', 'kube-system', 'fluentd', 4),
+            ['-n', 'kube-system', 'rollout', 'undo', 'daemonsets/fluentd', '--to-revision=4'],
+        )
+
+    def test_images_from_cr_data_dict(self):
+        # ControllerRevision.data(dict) 에서 spec.template.spec.containers 이미지 추출
+        data = {'spec': {'template': {'spec': {'containers': [
+            {'name': 'app', 'image': 'nginx:1.25'}, {'image': 'sidecar:2'}]}}}}
+        self.assertEqual(polaris._images_from_cr_data(data), ['nginx:1.25', 'sidecar:2'])
+
+    def test_images_from_cr_data_json_str_and_bytes(self):
+        import json
+        s = json.dumps({'spec': {'template': {'spec': {'containers': [{'image': 'redis:7'}]}}}})
+        self.assertEqual(polaris._images_from_cr_data(s), ['redis:7'])
+        self.assertEqual(polaris._images_from_cr_data(s.encode('utf-8')), ['redis:7'])
+
+    def test_images_from_cr_data_malformed_returns_empty(self):
+        # 구조가 다르거나 None/리스트/깨진 입력 → 빈 리스트 (나머지 리비전 정보는 유지)
+        self.assertEqual(polaris._images_from_cr_data(None), [])
+        self.assertEqual(polaris._images_from_cr_data('not json'), [])
+        self.assertEqual(polaris._images_from_cr_data([1, 2, 3]), [])
+        self.assertEqual(polaris._images_from_cr_data({'spec': {'template': {}}}), [])
+
     def test_normalize_kubectl_kind(self):
         self.assertEqual(polaris._normalize_kubectl_kind('deploy'), 'deployments')
         self.assertEqual(polaris._normalize_kubectl_kind('sts'), 'statefulsets')
@@ -670,8 +747,8 @@ class RbacRiskyReportTests(unittest.TestCase):
         rbac = [f for f in findings if f['category'] == 'rbac']
         self.assertEqual(len(rbac), 2)
         by_name = {f['name']: f for f in rbac}
-        # ServiceAccount 가 cluster-admin → critical
-        self.assertEqual(by_name['ServiceAccount/ci-deployer']['severity'], 'critical')
+        # ServiceAccount 가 cluster-admin → high (v1.4.13: critical 아님 — 바로 지우면 컨트롤러가 멈춘다)
+        self.assertEqual(by_name['ServiceAccount/ci-deployer']['severity'], 'high')
         self.assertEqual(by_name['User/alice']['severity'], 'high')
 
     def test_no_risky_no_findings(self):
@@ -799,6 +876,14 @@ class AppLifecycleTests(unittest.TestCase):
         self.assertTrue(report['infra_dependencies']['cryptography'])
         self.assertTrue(report['infra_dependencies']['paramiko'])
 
+        # 원격 데스크톱(v1.3.27) — 셈 DLL 번들 누락과 comtypes 코드생성 실패는
+        # **frozen 빌드에서만** 드러난다. selfcheck 가 그것을 보고하지 않으면
+        # GUI 를 열고 실제 서버에 붙어 봐야 알게 된다.
+        self.assertIn('rdp', report)
+        self.assertIn('control', report['rdp'])
+        for method in ('rdp_open', 'rdp_place', 'rdp_status'):
+            self.assertTrue(report['api_methods'].get(method), method)
+
     def test_settings_persist_known_theme_id(self):
         original_settings_path = polaris.PolarisAPI._SETTINGS_PATH
         try:
@@ -832,6 +917,64 @@ class AppLifecycleTests(unittest.TestCase):
                 self.assertEqual(api.get_settings()['themeId'], 'polaris')
         finally:
             polaris.PolarisAPI._SETTINGS_PATH = original_settings_path
+
+    # ── 커스텀 테마 색 저장 (v1.3.34) ───────────────────────────────────────
+    # _normalize_settings 는 **화이트리스트**다. customTheme 을 안 넣으면
+    # save_settings 가 조용히 버린다 — 저장은 성공했다고 나오고 다음 실행에서
+    # 색이 사라진다. 이 저장소에서 같은 사고를 세 번 겪었다.
+
+    def test_custom_theme_colors_survive_save_and_load(self):
+        original = polaris.PolarisAPI._SETTINGS_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                polaris.PolarisAPI._SETTINGS_PATH = Path(tmp) / 'settings.json'
+                api = polaris.PolarisAPI()
+
+                saved = api.save_settings({
+                    'themeId': 'custom',
+                    'customTheme': {'bg': '#FFFFFF', 'text': '#111111',
+                                    'accent': '#1d4ed8',
+                                    'overrides': {'--bg-2': '#eeeeee'}},
+                })
+                self.assertTrue(saved['ok'])
+                got = saved['settings']['customTheme']
+                self.assertEqual(got['bg'], '#ffffff')
+                self.assertEqual(got['overrides'], {'--bg-2': '#eeeeee'})
+
+                # 새 인스턴스로 다시 읽어도 남아 있어야 한다 (파일까지 갔는지)
+                again = polaris.PolarisAPI().get_settings()
+                self.assertEqual(again['themeId'], 'custom')
+                self.assertEqual(again['customTheme']['text'], '#111111')
+                self.assertEqual(again['customTheme']['accent'], '#1d4ed8')
+        finally:
+            polaris.PolarisAPI._SETTINGS_PATH = original
+
+    def test_custom_theme_rejects_junk(self):
+        """색이 아닌 값·모르는 토큰은 버린다 — CSS 로 흘려보내면 안 된다."""
+        original = polaris.PolarisAPI._SETTINGS_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                polaris.PolarisAPI._SETTINGS_PATH = Path(tmp) / 'settings.json'
+                api = polaris.PolarisAPI()
+
+                saved = api.save_settings({'customTheme': {
+                    'bg': 'red; background: url(x)',       # 색 형식 아님
+                    'text': '#12345',                      # 자릿수 안 맞음
+                    'accent': '#abc',                      # 3자리는 허용
+                    'overrides': {
+                        '--bg-2': '#123456',               # OK
+                        '--bg-3': 'javascript:alert(1)',   # 색 아님
+                        '--unknown-token': '#000000',      # 목록에 없음
+                    },
+                }})
+                self.assertTrue(saved['ok'])
+                ct = saved['settings']['customTheme']
+                self.assertEqual(ct['bg'], '#f4f1e8', '이상한 값은 기본값으로')
+                self.assertEqual(ct['text'], '#201d17')
+                self.assertEqual(ct['accent'], '#abc')
+                self.assertEqual(ct['overrides'], {'--bg-2': '#123456'})
+        finally:
+            polaris.PolarisAPI._SETTINGS_PATH = original
 
     def test_tray_close_hides_window_without_synchronous_js_notification(self):
         class FakeWindow:
@@ -1061,27 +1204,39 @@ class BuildToolSelectionTests(unittest.TestCase):
         self.assertIn(('pystray', 'pystray'), missing)
         self.assertIn(('PIL', 'Pillow'), missing)
         self.assertIn(('cryptography', 'cryptography'), missing)
-        self.assertIn(('paramiko', 'paramiko'), missing)
+        self.assertIn(('mcp', 'mcp'), missing)
         self.assertNotIn(('docx', 'python-docx'), missing)
         self.assertNotIn(('PyInstaller', 'pyinstaller'), missing)
 
 
+@unittest.skipIf(create_releases is None, '내부 릴리스 스크립트 없음(공개 저장소)')
 class ReleaseScriptTests(unittest.TestCase):
-    def test_create_release_links_single_polaris_exe_artifact(self):
+    def test_create_release_links_setup_exe(self):
+        # v1.2.25~ : exe 는 git 에 커밋하지 않고 generic 패키지 레지스트리에 업로드해 링크한다
+        # (raw git blob 링크 방식 폐지). 포터블 zip 은 어디에도 없어야 한다.
         calls = []
-        original = create_releases.api_request
+        original_api = create_releases.api_request
+        original_upload = create_releases.upload_package_file
         try:
             create_releases.api_request = lambda method, path, body=None: calls.append((method, path, body)) or {'_links': {'self': 'ok'}}
+            create_releases.upload_package_file = lambda version, fname: True
 
-            create_releases.create_release('v1.0.6', '세션 공유 WAS', 'release body')
+            create_releases.create_release('v1.2.20', 'exe-only 전환', 'release body', with_package=True)
         finally:
-            create_releases.api_request = original
+            create_releases.api_request = original_api
+            create_releases.upload_package_file = original_upload
 
         payload = calls[0][2]
-        link = payload['assets']['links'][0]
-        self.assertEqual(link['name'], 'polaris.exe')
-        self.assertIn('/-/raw/v1.0.6/dist/polaris.exe?inline=false', link['url'])
-        self.assertIn('[polaris.exe]', payload['description'])
+        links = payload['assets']['links']
+        self.assertEqual(links[0]['name'], 'polaris-setup-win64.exe')
+        self.assertIn('/packages/generic/polaris-free/v1.2.20/polaris-setup-win64.exe', links[0]['url'])
+        self.assertIn('[설치 파일 polaris-setup-win64.exe]', payload['description'])
+        names = [l['name'] for l in links]
+        self.assertIn('polaris-setup-win64.exe.sha256', names)
+        self.assertIn('polaris-setup-win64.exe.sha512', names)
+        # 포터블 zip 폐지 — 링크/본문 어디에도 zip 이 없어야 한다.
+        self.assertFalse(any('polaris-win64.zip' in n for n in names))
+        self.assertNotIn('polaris-win64.zip', payload['description'])
 
 
 if __name__ == '__main__':

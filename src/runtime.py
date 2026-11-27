@@ -9,6 +9,7 @@ import json
 import queue
 import socket
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,8 +18,8 @@ from src.paths import polaris_dir
 _LIFECYCLE_OPEN = 'open'
 _LIFECYCLE_QUIT = 'quit'
 _INSTANCE_HOST = '127.0.0.1'
-_INSTANCE_PORT = 43711
-_INSTANCE_SIGNAL = b'NIMBUS_POLARIS_OPEN_V1\n'
+_INSTANCE_PORT = 43721   # 정식판(43711)과 따로 — 둘을 같이 띄울 수 있게
+_INSTANCE_SIGNAL = b'POLARIS_FREE_OPEN_V1\n'
 _INSTANCE_ACK = b'OK\n'
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,12 +212,44 @@ def _run_lifecycle_loop(action_queue, stop_event, handlers):
             _app_log_event(f'lifecycle handler failed: {action}: {e}')
 
 
+def _unblock_bundle():
+    """번들 파일의 Zone.Identifier(Mark of the Web)를 제거 — frozen 빌드 전용.
+
+    onedir 배포 zip 을 인터넷에서 받아 탐색기로 압축 해제하면 풀린 파일마다
+    "인터넷에서 받음" 표식(Zone.Identifier ADS)이 붙는다. .NET 관리 어셈블리
+    (pythonnet 의 Python.Runtime.dll)는 이 표식이 있으면 로드가 차단돼,
+    pywebview(winforms) 초기화가 'Failed to resolve Python.Runtime.Loader.Initialize'
+    로 실패한다. (순수 native DLL 은 영향 없지만 .NET 어셈블리만 막힌다.)
+
+    수동 `Unblock-File` 없이도 바로 실행되도록, webview 초기화 전에 번들 디렉터리의
+    표식을 스스로 제거한다. best-effort — 실패는 무시(읽기전용 위치 등).
+    """
+    if not getattr(sys, 'frozen', False) or sys.platform != 'win32':
+        return
+    base = getattr(sys, '_MEIPASS', None)
+    if not base:
+        return
+    removed = 0
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            try:
+                os.remove(os.path.join(root, fn) + ':Zone.Identifier')
+                removed += 1
+            except OSError:
+                pass   # 표식 없음(대부분) 또는 제거 불가 — 무시
+    if removed:
+        _app_log_event(f'MOTW 해제: 번들 {removed}개 파일 Zone.Identifier 제거')
+
+
 def main(version: str, api_cls):
     """PyWebView 메인 진입점.
 
     version: 'X.Y.Z' 형식의 버전 문자열 (창 타이틀, 트레이 툴팁에 사용)
     api_cls: PolarisAPI 클래스 (또는 호환 API 클래스)
     """
+    # 다운로드 zip 압축 해제 시 .NET 어셈블리에 붙는 MOTW 제거 (webview/pythonnet 로드 전)
+    _unblock_bundle()
+
     try:
         import webview
     except ImportError:
@@ -237,25 +270,73 @@ def main(version: str, api_cls):
         return
     _start_instance_signal_server(action_queue, lifecycle_stop)
 
+    # 데이터 폴더 ACL 하드닝 (best-effort, v1.2.3) — vault.json / session.json /
+    # snapshots 등이 권한이 느슨한
+    # 위치(데이터 폴더 이전)에 놓였을 때 같은 PC 다른 사용자의 열람을 차단한다.
+    try:
+        from src import winsec
+        ddir = polaris_dir()
+        ddir.mkdir(parents=True, exist_ok=True)
+        winsec.harden_dir(ddir, log=_app_log_event)
+    except Exception as e:
+        _app_log_event(f'data dir ACL 하드닝 실패(무시): {e}')
+
     api = api_cls()
 
+    # JS → Python 다리 문지기(v1.5.28 보안 검토) — 밑줄 · 점 이름 호출과 위험한 새 창 주소를 막는다.
+    # 창을 만들기 **전에** 건다(보조 창도 같은 함수를 지난다)
+    try:
+        from src import bridgeguard
+        if not bridgeguard.install():
+            _app_log_event('다리 문지기를 걸지 못함 — pywebview 구조가 바뀌었을 수 있다')
+    except Exception as e:
+        _app_log_event(f'다리 문지기 실패: {e}')
+
     window = webview.create_window(
-        title=f'Polaris v{version}',
+        title=f'Polaris Free v{version}',
         url=dist.as_uri(),
         js_api=api,
         width=1400,
         height=900,
         min_size=(960, 640),
         resizable=True,
-        frameless=False,
-        easy_drag=False,
+        frameless=True,    # 커스텀 타이틀바(App Titlebar)로 OS 크롬 숨김 — 설치기처럼 "한 덩어리"
+        easy_drag=False,   # 드래그는 pywebview-drag-region 으로 명시 영역만
     )
     api._window = window
+    # 보조 창(명령기록 등)이 같은 index.html 을 `#route` 로 열 수 있도록 경로 전달
+    api._dist_uri = dist.as_uri()
+    # 창이 앱 화면 밖으로 넘어가면 그 페이지가 js_api 를 통째로 얻는다 — 막는다(v1.3.39)
+    from src import navguard
+    navguard.install(window, dist.as_uri(), log=_app_log_event)
+    # 커스텀 닫기(exit) → 트레이 quit 과 동일한 lifecycle 경로 사용 (thread-safe)
+    api._on_quit_request = lambda: _queue_lifecycle_action(action_queue, _LIFECYCLE_QUIT)
 
     # ── 트레이 통합 (v3.7.11) ────────────────────────────────────────────
     # X 버튼 = 설정에 따라 트레이 hide 또는 완전 종료
     # 트레이 메뉴: "열기" (default = 더블클릭), "종료"
     tray_state = {'icon': None, 'force_quit': False}
+    # 알림(v1.2.113)이 트레이 풍선 알림을 쏘려면 icon 참조가 필요 — 트레이 스레드가
+    # 아직 icon 을 못 만든 시점이어도 dict 는 공유 참조라 나중에 채워짐.
+    api._tray_state = tray_state
+    api.start_notification_watcher()
+
+    # kubernetes 라이브러리는 처음 쓸 때 불러온다(v1.3.73 — 시작 1.5초 단축). 창이 뜬 뒤
+    # 백그라운드로 미리 불러 두어 첫 클러스터 연결이 그만큼 느려지지 않게 한다.
+    def _preload_k8s():
+        time.sleep(3)
+        try:
+            from src.k8s import preload_k8s
+            preload_k8s()
+        except Exception:
+            pass
+        try:
+            # 지난번 강제 종료로 남은 평문 임시 kubeconfig 정리 (v1.5.28 검토)
+            from src.k8s import sweep_stale_temp_kubeconfigs
+            sweep_stale_temp_kubeconfigs()
+        except Exception:
+            pass
+    threading.Thread(target=_preload_k8s, daemon=True, name='polaris-k8s-preload').start()
 
     def _on_tray_open(icon=None, item=None):
         """트레이 → 윈도우 표시 요청."""
@@ -284,9 +365,25 @@ def main(version: str, api_cls):
         """
         return _handle_window_closing(api, window, tray_state)
 
+    def _on_window_shown():
+        """창이 뜨면 **작업표시줄 최소화**를 켠다 (v1.3.24, 사용자 신고).
+
+        frameless 창이라 pywebview 가 WS_MINIMIZEBOX 를 안 켜 두는데, 윈도우는
+        그 비트로 「작업표시줄 버튼으로 내릴 수 있는 창인가」를 판단한다.
+        창이 실제로 만들어진 뒤라야 HWND 를 찾을 수 있어 여기서 한다.
+        """
+        try:
+            api.enable_taskbar_minimize()
+        except Exception:
+            pass
+
     # 이벤트 핸들러 등록 (일부는 환경에 따라 없을 수 있어 보호)
     try:
         window.events.closing += _on_window_closing
+    except Exception:
+        pass
+    try:
+        window.events.shown += _on_window_shown
     except Exception:
         pass
 
@@ -302,7 +399,7 @@ def main(version: str, api_cls):
             icon = pystray.Icon(
                 'polaris',
                 _make_tray_image(),
-                f'Polaris v{version}',
+                f'Polaris Free v{version}',
                 menu,
             )
             tray_state['icon'] = icon

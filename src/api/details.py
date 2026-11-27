@@ -5,10 +5,16 @@ from datetime import datetime, timezone
 from src.tools import _run_kubectl
 from src.k8s import (
     _age,
-    _is_secret_kind, _redact_secret_yaml, _redact_secret_describe,
+    _is_secret_kind, _redact_secret_yaml, _redact_secret_describe, _kubectl_target_error,
+    _redact_sensitive_yaml_fields, _redact_sensitive_describe_fields,
     _resource_event_field_selector, _normalize_log_source_type,
     _WORKLOAD_LOG_TYPES,
 )
+
+# CRD 커스텀 객체는 kind 가 'plural.group' 형식(예: externalsecrets.external-secrets.io)이라
+# 이 코드베이스의 built-in kind(예: 'pods', 'secrets' — 항상 dot 없음)와 확실히 구분된다.
+def _is_crd_kind(kind: str) -> bool:
+    return '.' in (kind or '')
 
 
 class DetailsMixin:
@@ -117,6 +123,13 @@ class DetailsMixin:
         """파드 로그 (kubectl logs)."""
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': '연결되지 않음', 'logs': ''}
+        bad = _kubectl_target_error(ns=ns, name=name, container=container or '')   # kubectl 인자 끼워넣기 방지(v1.5.28)
+        if bad:
+            return {'ok': False, 'error': bad, 'logs': ''}
+        try:
+            tail = max(1, min(int(tail), 100000))
+        except (TypeError, ValueError):
+            tail = 200
         args = ['logs', f'-n={ns}', name, f'--tail={tail}']
         if container:
             args += ['-c', container]
@@ -137,14 +150,24 @@ class DetailsMixin:
         """kubectl get <kind> <name> -o yaml."""
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': '연결되지 않음', 'yaml': ''}
+        bad = _kubectl_target_error(kind=kind, ns=ns, name=name)
+        if bad:
+            return {'ok': False, 'error': bad, 'yaml': ''}
         kubectl_kind = self._KUBECTL_KIND_MAP.get(kind, kind)
         args = ['get', kubectl_kind, name, '-o', 'yaml'] + (['-n', ns] if ns else [])
         out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
         if err and not out:
             return {'ok': False, 'error': err, 'yaml': ''}
-        # 보안 — Secret 의 data / stringData 평문(=base64 토큰·TLS key 등) UI 노출 차단
+        # 보안 — Secret 의 data / stringData 평문(=base64 토큰·TLS key 등) UI 노출 차단.
+        # kind 이름으로 고르지 않고 **출력**으로 판단한다(v1.5.28) — 「secrets.v1.」 같은 다른 표기로 가리기를 피하던 길.
+        # _redact_secret_yaml 은 출력에 kind: Secret 이 없으면 그대로 돌려준다
+        out = _redact_secret_yaml(out)
         if _is_secret_kind(kind):
-            out = _redact_secret_yaml(out)
+            pass
+        elif _is_crd_kind(kind):
+            # CRD 커스텀 객체(DB 오퍼레이터 등)는 spec 에 자격증명을 인라인으로 담기도 함 —
+            # kind 가 'Secret' 이 아니라 위 마스킹 대상이 아니었던 우회 경로.
+            out = _redact_sensitive_yaml_fields(out)
         return {'ok': True, 'yaml': out, 'error': err or ''}
 
 
@@ -152,13 +175,19 @@ class DetailsMixin:
         """kubectl describe <kind> <name>."""
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': '연결되지 않음', 'describe': ''}
+        bad = _kubectl_target_error(kind=kind, ns=ns, name=name)
+        if bad:
+            return {'ok': False, 'error': bad, 'describe': ''}
         kubectl_kind = self._KUBECTL_KIND_MAP.get(kind, kind)
         args = ['describe', kubectl_kind, name] + (['-n', ns] if ns else [])
         out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
         if err and not out:
             return {'ok': False, 'error': err, 'describe': ''}
         # 보안 — describe 자체는 길이만 노출하지만, Annotations/Token 영역 보강 마스킹
-        if _is_secret_kind(kind):
+        # 「secrets.v1.」 · 「Secret」 처럼 다른 표기로 와도 Secret 으로 본다(v1.5.28 검토) — 그룹 꼬리를 떼고 판단
+        if _is_secret_kind(kind) or _is_secret_kind(kind.split('.')[0]):
             out = _redact_secret_describe(out)
+        elif _is_crd_kind(kind):
+            out = _redact_sensitive_describe_fields(out)
         return {'ok': True, 'describe': out, 'error': err or ''}
 

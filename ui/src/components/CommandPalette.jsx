@@ -1,24 +1,32 @@
 /**
- * CommandPalette — ⌘K 명령 팔레트 (v3.7.3)
+ * CommandPalette — Ctrl+K 명령 팔레트 (v3.7.3, v1.2.99 전 페이지+즐겨찾기/최근)
  *
  * 검색 가능한 빠른 네비게이션 / 명령 실행 UI.
  * 키보드: Ctrl/Cmd+K로 열기, Esc로 닫기, ↑↓ 이동, Enter 실행.
  *
  * 검색 대상:
- *   1) 페이지 / 도구 (정적)
+ *   1) 페이지 / 도구 (정적 — 사이드바 전 메뉴 노출: 스냅샷 · RBAC · CRD 포함)
  *   2) 클러스터 전환 (현재 비활성 탭)
- *   3) 명령 (새 클러스터 연결, 새로고침)
- *   4) 실제 K8s 리소스 — 파드, 디플로이먼트, 서비스, 컨피그맵 등
- *      (활성 클러스터에서 가져온 인덱스 기반, 30s 캐시)
+ *   3) 명령 (새 클러스터 연결)
+ *   4) 실제 K8s 리소스 — 파드, 디플로이먼트, 서비스, 컨피그맵 등 (30s 캐시)
+ *   5) CHECK 화면(클러스터 스캔 · 업그레이드 사전 점검 · 클러스터 보고서)
+ *
+ * 고르면 **그 항목의 탭으로 옮겨 간다**(K8S · CHECK).
+ *
+ * 즐겨찾기(★)/최근(clock): 정적 항목(페이지·리소스 종류·도구)에 한해 localStorage 로 보관,
+ * 검색어가 비어 있을 때 상단에 표시. (실제 K8s 리소스/클러스터/명령은 대상 아님)
  */
-import React, { useState, useEffect, useRef, useMemo } from 'react'
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { useApp } from '../store.jsx'
 import { api } from '../api.js'
+import { checkPageItems } from '../checkPages.js'
 import {
   LayoutDashboard, Globe, FileText,
   Server, Boxes, Layers, ChevronsUp, ChevronsDown, Briefcase, Clock,
   Network, Lock, Key, HardDrive, Package, GitBranch,
-  Terminal, Activity, Monitor, RefreshCw, Plus, Box, Cable,
+  Terminal, Activity, Monitor, Plus, Box, Cable,
+  Camera, Archive, ArrowRightLeft, AppWindow, Shield, KeyRound, Star, HeartPulse,
+  FlaskConical,
 } from 'lucide-react'
 
 // ── 리소스 kind → 아이콘 / rtype ─────────────────────────────────────────────
@@ -43,11 +51,17 @@ const KIND_META = {
 // ── 네비게이션 항목 ──────────────────────────────────────────────────────────
 const NAV_PAGES = [
   { id: 'dashboard', label: '대시보드',      icon: LayoutDashboard, kind: 'page', page: 'dashboard' },
+  { id: 'multicluster', label: '멀티클러스터', icon: Layers,         kind: 'page', page: 'multicluster' },
   { id: 'topology',  label: '토폴로지',      icon: Globe,           kind: 'page', page: 'topology', requiresConn: true },
   { id: 'events',    label: '이벤트 타임라인', icon: Activity,       kind: 'page', page: 'events',   requiresConn: true },
-  { id: 'report',    label: '보고서',        icon: FileText,        kind: 'page', page: 'report',   requiresConn: true },
+  { id: 'snapshots', label: '스냅샷',        icon: Camera,          kind: 'page', page: 'snapshots', requiresConn: true },
+  { id: 'yamllab',   label: 'YAML 실험실',   icon: FlaskConical,    kind: 'page', page: 'yamllab',  requiresConn: true, sub: '매니페스트 · 적용 · 내보내기' },
+  // sub 는 검색 해이스택(label+sub+id)에 들어간다 — 「헬스 체크」 로도 찾히게 남겨둠
+  // 클러스터 스캔 · 업그레이드 사전 점검 · 보고서는 CHECK 탭 — 아래 checkPageItems 가 띄운다
   { id: 'logs',      label: '로그뷰어',      icon: Activity,        kind: 'page', page: 'logs',     requiresConn: true },
   { id: 'portforward', label: '포트포워딩', icon: Cable,           kind: 'page', page: 'portforward', requiresConn: true },
+  { id: 'rbac',      label: 'RBAC 분석',     icon: Shield,          kind: 'page', page: 'rbac',     requiresConn: true },
+  { id: 'crds',      label: 'CRD 커스텀 리소스', icon: KeyRound,    kind: 'page', page: 'crds',     requiresConn: true },
   { id: 'k9s',       label: 'k9s',          icon: Monitor,         kind: 'page', page: 'k9s',      requiresConn: true },
   { id: 'terminal',  label: 'kubectl 터미널', icon: Terminal,        kind: 'page', page: 'terminal', requiresConn: true },
 ]
@@ -78,31 +92,91 @@ const NAV_TOOLS = [
 // ── 명령어 ───────────────────────────────────────────────────────────────────
 const COMMANDS = [
   { id: 'cmd:connect', label: '새 클러스터 연결', icon: Plus,      kind: 'command', action: 'connect' },
-  { id: 'cmd:refresh', label: '새로고침',          icon: RefreshCw, kind: 'command', action: 'refresh' },
+  // 「새로고침」 명령은 타이틀바 ↻ 와 같은 동작이라 함께 뺐다(v1.3.46)
 ]
+
+// ── 정적 항목 레지스트리 (즐겨찾기/최근 id → 재구성용) ─────────────────────────
+// 페이지/리소스종류/도구만 즐겨찾기·최근 대상. 명령·클러스터·실 리소스는 제외.
+const STATIC_REGISTRY = {}
+for (const it of NAV_PAGES) STATIC_REGISTRY[it.id] = { ...it, kind: 'page', group: '페이지' }
+for (const it of NAV_TOOLS) STATIC_REGISTRY[it.id] = { ...it, kind: 'page', group: '도구' }
+for (const it of NAV_RESOURCES) STATIC_REGISTRY[it.id] = { ...it, kind: 'resource', group: '리소스 종류', requiresConn: true }
+
+function _isFavoritable(item) {
+  return !!(item && STATIC_REGISTRY[item.id] &&
+            (item.kind === 'page' || item.kind === 'resource'))
+}
+
+function _visible(it, ctx) {
+  if (it.requiresConn && !ctx.connected) return false
+  return true
+}
+
+// ── localStorage (즐겨찾기/최근) ──────────────────────────────────────────────
+const FAV_KEY    = 'polaris.palette.favorites'
+const RECENT_KEY = 'polaris.palette.recent'
+const RECENT_MAX = 8
+
+function _loadIds(key) {
+  try {
+    const a = JSON.parse(localStorage.getItem(key) || '[]')
+    return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []
+  } catch { return [] }
+}
+function _saveIds(key, ids) {
+  try { localStorage.setItem(key, JSON.stringify(ids.slice(0, 40))) } catch { /* quota/무시 */ }
+}
+
+/** 이 항목을 고르면 어느 탭으로 가야 하는가 (다른 탭에서 골라도 화면이 바뀌게) */
+function modeFor(item) {
+  if (!item) return null
+  if (item.kind === 'check-page') return 'check'
+  if (['page', 'resource', 'k8s-resource', 'cluster'].includes(item.kind)) return 'k8s'
+  return null   // 명령(새 클러스터 연결)은 창만 띄운다 — 탭은 그대로
+}
 
 // ── 메인 컴포넌트 ────────────────────────────────────────────────────────────
 export default function CommandPalette({ open, onClose }) {
   const {
     connected, clusters, activeClusterId,
-    navigate, switchCluster, setShowConnect, refreshStatus,
+    navigate, switchCluster, setShowConnect,
     setNamespace,
+    appMode, setAppMode,
+    setCheckActivePage,
   } = useApp()
+  const gateCtx = useMemo(() => ({ connected }), [connected])
 
   const [query, setQuery]       = useState('')
   const [selected, setSelected] = useState(0)
   const [resourceIdx, setResourceIdx] = useState([])
   const [idxLoading, setIdxLoading]   = useState(false)
   const [idxError, setIdxError]       = useState(null)
+  const [favorites, setFavorites]     = useState(() => _loadIds(FAV_KEY))
+  const [recent, setRecent]           = useState(() => _loadIds(RECENT_KEY))
   const inputRef = useRef(null)
   const listRef  = useRef(null)
+
+  const toggleFavorite = useCallback((id) => {
+    setFavorites(prev => {
+      const next = prev.includes(id) ? prev.filter(x => x !== id) : [id, ...prev]
+      _saveIds(FAV_KEY, next)
+      return next
+    })
+  }, [])
+
+  const pushRecent = useCallback((id) => {
+    setRecent(prev => {
+      const next = [id, ...prev.filter(x => x !== id)].slice(0, RECENT_MAX)
+      _saveIds(RECENT_KEY, next)
+      return next
+    })
+  }, [])
 
   // 열릴 때 input 포커스 + 초기화
   useEffect(() => {
     if (open) {
       setQuery('')
       setSelected(0)
-      // pywebview/안드로이드 keyboard 이슈 대응 위해 timeout
       setTimeout(() => inputRef.current?.focus(), 20)
     }
   }, [open])
@@ -122,7 +196,6 @@ export default function CommandPalette({ open, onClose }) {
         if (Array.isArray(res)) {
           setResourceIdx(res)
         } else {
-          // callSafe 에러 형태 {ok:false, error}
           setResourceIdx([])
           if (res?.error) setIdxError(String(res.error))
         }
@@ -164,59 +237,53 @@ export default function CommandPalette({ open, onClose }) {
       }
     }
 
-    // 2) 정적 항목 빌드
+    // 2) 정적 항목 빌드 (게이팅 적용)
     const staticItems = []
-
-    // 페이지
     for (const it of NAV_PAGES) {
-      if (it.requiresConn && !connected) continue
-      staticItems.push({ ...it, group: '페이지' })
+      if (_visible(it, gateCtx)) staticItems.push({ ...it, group: '페이지' })
     }
-
-    // 리소스 종류 바로가기 (연결 시에만)
     if (connected) {
       for (const it of NAV_RESOURCES) {
         staticItems.push({ ...it, kind: 'resource', group: '리소스 종류' })
       }
     }
-
-    // 도구
     for (const it of NAV_TOOLS) {
-      if (it.requiresConn && !connected) continue
-      staticItems.push({ ...it, group: '도구' })
+      if (_visible(it, gateCtx)) staticItems.push({ ...it, group: '도구' })
     }
-
-    // 클러스터 전환 (현재 활성 제외)
     for (const c of clusters) {
       if (c.id === activeClusterId) continue
       staticItems.push({
-        id:         'cluster:' + c.id,
-        label:      c.display_name,
-        sub:        c.context || '',
-        icon:       Server,
-        kind:       'cluster',
-        clusterId:  c.id,
-        group:      '클러스터 전환',
+        id: 'cluster:' + c.id, label: c.display_name, sub: c.context || '',
+        icon: Server, kind: 'cluster', clusterId: c.id, group: '클러스터 전환',
       })
     }
-
-    // 명령
     for (const cmd of COMMANDS) {
       staticItems.push({ ...cmd, group: '명령' })
     }
 
-    // 3) 쿼리 필터
-    let filteredStatic = staticItems
+    // 3) 쿼리 있으면 필터 (리소스 결과 상단)
     if (q) {
-      filteredStatic = staticItems.filter(it => {
+      const filtered = staticItems.filter(it => {
         const hay = (it.label + ' ' + (it.sub || '') + ' ' + (it.id || '')).toLowerCase()
         return hay.includes(q)
       })
+      return [...resourceMatches, ...filtered, ...checkPageItems(q)]
     }
 
-    // 리소스 결과를 상단에 (쿼리가 있을 때만 표시)
-    return q ? [...resourceMatches, ...filteredStatic] : staticItems
-  }, [query, connected, clusters, activeClusterId, resourceIdx])
+    // 4) 쿼리 없으면 즐겨찾기 / 최근 을 상단에 (정적 항목만, 게이팅·중복 정리)
+    const favItems = favorites
+      .map(id => STATIC_REGISTRY[id]).filter(Boolean)
+      .filter(it => _visible(it, gateCtx))
+      .map(it => ({ ...it, group: '즐겨찾기' }))
+    const favSet = new Set(favorites)
+    const recentItems = recent
+      .filter(id => !favSet.has(id))
+      .map(id => STATIC_REGISTRY[id]).filter(Boolean)
+      .filter(it => _visible(it, gateCtx))
+      .map(it => ({ ...it, group: '최근' }))
+
+    return [...favItems, ...recentItems, ...staticItems, ...checkPageItems('')]
+  }, [query, connected, clusters, activeClusterId, resourceIdx, favorites, recent, gateCtx])
 
   // selected가 items 범위를 벗어나면 보정
   useEffect(() => {
@@ -254,16 +321,21 @@ export default function CommandPalette({ open, onClose }) {
   }, [open, items, selected])
 
   function execute(item) {
+    if (_isFavoritable(item)) pushRecent(item.id)   // 정적 네비 항목만 최근에 기록
+    // 항목의 탭으로 먼저 옮긴다 — 안 하면 다른 탭에서 골랐을 때 화면이 그대로다
+    const mode = modeFor(item)
+    if (mode && mode !== appMode) setAppMode(mode)
     switch (item.kind) {
+      case 'check-page':
+        setCheckActivePage(item.checkPage)
+        break
       case 'page':
         navigate(item.page)
         break
       case 'resource':
-        // 사이드바 리소스 종류 클릭과 동일 동작
         navigate('resources', item.resource)
         break
       case 'k8s-resource':
-        // 실제 리소스 — 네임스페이스 자동 전환 후 해당 종류 브라우저로 이동
         if (item.k8sNs) setNamespace(item.k8sNs)
         navigate('resources', item.k8sRtype)
         break
@@ -272,7 +344,6 @@ export default function CommandPalette({ open, onClose }) {
         break
       case 'command':
         if (item.action === 'connect') setShowConnect(true)
-        else if (item.action === 'refresh') refreshStatus()
         break
       default:
         break
@@ -340,9 +411,11 @@ export default function CommandPalette({ open, onClose }) {
           ) : items.map((item, idx) => {
             const isSel = idx === selected
             const Icon  = item.icon
+            const fav   = _isFavoritable(item) && favorites.includes(item.id)
+            const canFav = _isFavoritable(item)
             return (
               <div
-                key={item.id}
+                key={(item.group || '') + ':' + item.id}
                 data-selected={isSel}
                 onClick={() => execute(item)}
                 onMouseEnter={() => setSelected(idx)}
@@ -378,6 +451,20 @@ export default function CommandPalette({ open, onClose }) {
                     </span>
                   )}
                 </div>
+                {canFav && (isSel || fav) && (
+                  <button
+                    onClick={e => { e.stopPropagation(); toggleFavorite(item.id) }}
+                    title={fav ? '즐겨찾기 해제' : '즐겨찾기 추가'}
+                    style={{
+                      background: 'transparent', border: 'none', cursor: 'pointer',
+                      padding: 2, display: 'grid', placeItems: 'center', flexShrink: 0,
+                    }}
+                  >
+                    <Star size={13}
+                      color={fav ? 'var(--nimbus)' : 'var(--text-dim)'}
+                      fill={fav ? 'var(--nimbus)' : 'none'} />
+                  </button>
+                )}
                 <span style={{
                   fontSize: 10, color: 'var(--text-dim)',
                   letterSpacing: '0.04em', flexShrink: 0,
@@ -400,6 +487,7 @@ export default function CommandPalette({ open, onClose }) {
           <span><kbd style={kbdStyle}>↑↓</kbd> 이동</span>
           <span><kbd style={kbdStyle}>Enter</kbd> 선택</span>
           <span><kbd style={kbdStyle}>Esc</kbd> 닫기</span>
+          <span><kbd style={kbdStyle}>★</kbd> 즐겨찾기</span>
           <span style={{ flex: 1 }} />
           {idxLoading && (
             <span style={{ color: 'var(--nimbus)' }}>리소스 인덱싱 중...</span>

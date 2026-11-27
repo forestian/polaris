@@ -9,8 +9,10 @@
  *   - 자동 새로고침 (10s 폴링) 토글
  */
 import React, { useEffect, useState, useMemo, useRef } from 'react'
+import { startPoll } from '../poll.js'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
+import AiDiagnoseButton from '../components/AiDiagnose.jsx'
 import { Activity, RefreshCw, AlertCircle, Copy, Check, Download } from 'lucide-react'
 
 const RANGES = [
@@ -87,8 +89,7 @@ export default function EventsPage() {
   // 자동 새로고침 — 트레이로 hide된 동안은 일시정지 (v3.7.11)
   useEffect(() => {
     if (!autoRefresh || !connected || !windowVisible) return
-    const id = setInterval(load, 10000)
-    return () => clearInterval(id)
+    return startPoll(load, 10000)
   }, [autoRefresh, connected, namespace, windowVisible])
 
   // 범위 변경 시 버킷 선택 초기화
@@ -265,6 +266,13 @@ export default function EventsPage() {
           <Download size={11} />
           다운로드
         </button>
+
+        <AiDiagnoseButton source="events" disabled={filtered.length === 0}
+          title="현재 필터된 이벤트를 LLM 으로 진단/질의"
+          getPayload={() => ({
+            namespace: (namespace && namespace !== 'All Namespaces') ? namespace : '',
+            events: filtered,
+          })} />
 
         <button className="btn btn-default btn-sm" onClick={load} disabled={loading}>
           <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />

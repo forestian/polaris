@@ -1,10 +1,15 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, lazy, Suspense } from 'react'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
 import { buildPodExecCommand, buildPodLogTarget } from '../navigationTargets.js'
 import { X, RefreshCw, ChevronDown, Copy, Maximize2, Terminal, Play,
-         Pencil, Check, RotateCw, Scale } from 'lucide-react'
+         Pencil, Check, RotateCw, Scale, History } from 'lucide-react'
 import MetricsTab from './MetricsTab.jsx'
+
+// 대형 YAML 편집 모달 (CodeMirror · before/after) — 열 때만 로드
+const YamlEditorModal = lazy(() => import('./YamlEditorModal.jsx'))
+// 내장 파드 exec 셸 (xterm.js) — 열 때만 로드
+const PodExecModal = lazy(() => import('./PodExecModal.jsx'))
 
 const TABS_POD     = ['개요', '이벤트', '메트릭', '로그', 'YAML', 'Describe']
 const TABS_DEFAULT = ['개요', '이벤트', 'YAML', 'Describe']
@@ -12,6 +17,8 @@ const TABS_DEFAULT = ['개요', '이벤트', 'YAML', 'Describe']
 // scale / rollout restart 가능한 워크로드 종류
 const SCALABLE_KINDS   = new Set(['deployments', 'statefulsets', 'replicasets'])
 const RESTARTABLE_KINDS = new Set(['deployments', 'statefulsets', 'daemonsets'])
+// 리비전 롤백: Deployment(ReplicaSet 기반) + StatefulSet/DaemonSet(ControllerRevision 기반)
+const ROLLBACKABLE_KINDS = new Set(['deployments', 'statefulsets', 'daemonsets'])
 const SECRET_KINDS      = new Set(['secrets', 'secret'])
 
 // ── 복사 가능한 모노스페이스 블록 ─────────────────────────────────────────────
@@ -93,6 +100,7 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
   const isCronJob = kind === 'cronjobs'
   const isScalable    = SCALABLE_KINDS.has(kind)
   const isRestartable = RESTARTABLE_KINDS.has(kind)
+  const isRollbackable = ROLLBACKABLE_KINDS.has(kind)
   const isSecret      = SECRET_KINDS.has(kind)
   const TABS  = isPod ? TABS_POD : TABS_DEFAULT
   const { navigate, setLogTarget, setTerminalCommand } = useApp()
@@ -115,6 +123,11 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
   const [confirm, setConfirm]   = useState(null)       // {title, body, onYes} 확인 모달
   const [scaleModal, setScaleModal] = useState(false)  // replicas 입력 모달
   const [scaleValue, setScaleValue] = useState('')
+  const [rollbackModal, setRollbackModal] = useState(false)  // 리비전 롤백 모달
+  const [execTarget, setExecTarget] = useState(null)   // 내장 파드 셸 대상 {namespace, pod, container}
+  const [revisions, setRevisions]   = useState(null)   // {ok, revisions[], current} | null
+  const [revBusy, setRevBusy]       = useState(false)
+  const [selectedRev, setSelectedRev] = useState(null)
 
   const ns   = item?.namespace || ''
   const name = item?.name      || ''
@@ -128,6 +141,7 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     setTriggerMsg(null)
     setEditMode(false); setEditText(''); setWriteMsg(null); setConfirm(null)
     setScaleModal(false); setScaleValue('')
+    setRollbackModal(false); setRevisions(null); setSelectedRev(null); setRevBusy(false)
 
     if (isPod) loadDetail()
     loadEvents()
@@ -223,18 +237,18 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     setWriteMsg(null)
   }
 
-  function requestApply() {
+  function requestApply(yamlText) {
     setConfirm({
       title: 'YAML 적용',
       body: `편집한 YAML 을 클러스터에 적용합니다.\n\n${kind} / ${name}\n\nkubectl apply 와 동일하게 동작합니다. 계속하시겠습니까?`,
-      onYes: doApply,
+      onYes: () => doApply(yamlText),
     })
   }
 
-  async function doApply() {
+  async function doApply(yamlText) {
     setConfirm(null); setBusy(true); setWriteMsg(null)
     try {
-      const r = await api.applyResourceYaml(editText, kind)
+      const r = await api.applyResourceYaml(yamlText, kind)
       if (r?.ok) {
         setWriteMsg({ ok: true, text: r.output || '적용 완료' })
         setEditMode(false)
@@ -313,6 +327,37 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     setBusy(false)
   }
 
+  // ── 리비전 롤백 ───────────────────────────────────────────────────────────
+  async function openRollback() {
+    setRollbackModal(true); setRevisions(null); setSelectedRev(null); setRevBusy(true)
+    try {
+      const r = await api.getRolloutRevisions(kind, ns, name)
+      setRevisions(r)
+      if (r?.ok) {
+        // 기본 선택: 현재가 아닌 가장 최근 리비전(보통 직전 버전)
+        const prev = (r.revisions || []).find(x => !x.current)
+        setSelectedRev(prev ? prev.revision : null)
+      }
+    } catch (e) {
+      setRevisions({ ok: false, error: String(e) })
+    }
+    setRevBusy(false)
+  }
+
+  async function doRollback() {
+    if (selectedRev == null) return
+    setRollbackModal(false); setBusy(true); setWriteMsg(null)
+    try {
+      const r = await api.rolloutUndo(kind, ns, name, selectedRev)
+      setWriteMsg(r?.ok
+        ? { ok: true, text: r.output || `리비전 #${selectedRev} 로 롤백 요청됨` }
+        : { ok: false, text: r?.error || '롤백 실패' })
+    } catch (e) {
+      setWriteMsg({ ok: false, text: String(e) })
+    }
+    setBusy(false)
+  }
+
   function selectedContainer() {
     return container || detail?.containers?.[0]?.name || ''
   }
@@ -327,7 +372,14 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
     navigate('logs')
   }
 
-  async function openExecShell() {
+  // 내장 셸: Polaris 안에서 파드 exec 터미널을 연다(외부 터미널 안 띄움).
+  function openExecShell() {
+    setExecTarget({ namespace: ns, pod: name, container: selectedContainer() })
+  }
+
+  // 외부 터미널로 열기(폴백) — 내장 셸이 안 맞는 환경용. kubectl exec 명령을
+  // 터미널 페이지에 미리 채운다.
+  async function openExecShellExternal() {
     const selected = selectedContainer()
     const fallback = buildPodExecCommand({ namespace: ns, name, container: selected })
     try {
@@ -376,8 +428,12 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
               <Maximize2 size={12} /> Logs
             </button>
             <button className="btn btn-default btn-sm" onClick={openExecShell}
-              title="Open interactive pod shell" style={{ flexShrink: 0, gap: 4 }}>
+              title="Polaris 안에서 파드 셸 열기 (내장 터미널)" style={{ flexShrink: 0, gap: 4 }}>
               <Terminal size={12} /> Exec
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={openExecShellExternal}
+              title="외부 터미널로 열기" style={{ flexShrink: 0, padding: '0 6px' }}>
+              <Maximize2 size={11} />
             </button>
           </>
         )}
@@ -400,6 +456,13 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
             disabled={busy} title="파드 순차 재시작 (kubectl rollout restart)"
             style={{ flexShrink: 0, gap: 4 }}>
             <RotateCw size={12} /> Restart
+          </button>
+        )}
+        {isRollbackable && (
+          <button className="btn btn-default btn-sm" onClick={openRollback}
+            disabled={busy} title="이전 리비전으로 롤백 (kubectl rollout undo)"
+            style={{ flexShrink: 0, gap: 4 }}>
+            <History size={12} /> 롤백
           </button>
         )}
         <button className="btn btn-danger btn-sm" onClick={() => onDelete?.(item)}
@@ -700,29 +763,14 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
         {tab === 'YAML' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginBottom: 8 }}>
-              {!editMode && (
-                <>
-                  <button className="btn btn-ghost btn-sm" onClick={loadYaml} disabled={busy}>
-                    <RefreshCw size={11} /> 새로고침
-                  </button>
-                  {!isSecret && yaml?.ok && (
-                    <button className="btn btn-default btn-sm" onClick={startEdit} disabled={busy}
-                      style={{ gap: 4 }}>
-                      <Pencil size={11} /> 편집
-                    </button>
-                  )}
-                </>
-              )}
-              {editMode && (
-                <>
-                  <button className="btn btn-ghost btn-sm" onClick={cancelEdit} disabled={busy}>
-                    취소
-                  </button>
-                  <button className="btn btn-primary btn-sm" onClick={requestApply} disabled={busy}
-                    style={{ gap: 4 }}>
-                    <Check size={11} /> 적용 (Apply)
-                  </button>
-                </>
+              <button className="btn btn-ghost btn-sm" onClick={loadYaml} disabled={busy}>
+                <RefreshCw size={11} /> 새로고침
+              </button>
+              {!isSecret && yaml?.ok && (
+                <button className="btn btn-default btn-sm" onClick={startEdit} disabled={busy}
+                  style={{ gap: 4 }}>
+                  <Pencil size={11} /> 편집
+                </button>
               )}
             </div>
 
@@ -750,25 +798,9 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
               </div>
             )}
 
-            {editMode ? (
-              <textarea
-                value={editText}
-                onChange={e => setEditText(e.target.value)}
-                spellCheck={false}
-                style={{
-                  width: '100%', height: 480, resize: 'vertical',
-                  fontFamily: 'var(--font-mono)', fontSize: 11, lineHeight: 1.6,
-                  padding: '10px 12px', background: 'var(--bg-0)',
-                  border: '1px solid var(--nimbus)', borderRadius: 6,
-                  color: 'var(--text)', outline: 'none', whiteSpace: 'pre',
-                  overflowWrap: 'normal', boxSizing: 'border-box',
-                }}
-              />
-            ) : (
-              yaml === null ? <Loading /> :
-              yaml.ok === false ? <ErrMsg msg={yaml.error} /> :
-              <MonoBlock text={yaml.yaml} maxHeight={520} />
-            )}
+            {yaml === null ? <Loading /> :
+             yaml.ok === false ? <ErrMsg msg={yaml.error} /> :
+             <MonoBlock text={yaml.yaml} maxHeight={520} />}
           </div>
         )}
 
@@ -849,10 +881,119 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
         </div>
       )}
 
+      {/* ── 리비전 롤백 모달 (별도창, Scale 모달과 동일 스타일) ── */}
+      {rollbackModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          background: 'rgba(0,0,0,0.55)', display: 'grid', placeItems: 'center',
+        }} onClick={() => setRollbackModal(false)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            width: 560, maxWidth: '92vw', background: 'var(--bg-2)',
+            border: '1px solid var(--border)', borderRadius: 8, padding: 20,
+            boxShadow: '0 12px 48px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-bright)',
+              marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <History size={15} /> 리비전 롤백
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 4,
+              fontFamily: 'var(--font-mono)' }}>{kind} / {name}</div>
+            <div style={{ fontSize: 12, color: 'var(--text)', marginBottom: 12 }}>
+              되돌릴 리비전을 선택하세요 — 선택한 리비전의 파드 템플릿(이미지)으로 롤백됩니다.
+            </div>
+
+            {revBusy && (
+              <div style={{ color: 'var(--text-dim)', fontSize: 12, padding: '14px 0' }}>
+                리비전 불러오는 중...
+              </div>
+            )}
+            {!revBusy && revisions && revisions.ok === false && (
+              <div style={{ color: 'var(--red)', fontSize: 12, padding: '10px 0',
+                whiteSpace: 'pre-wrap' }}>{revisions.error}</div>
+            )}
+            {!revBusy && revisions?.ok && (revisions.revisions || []).length === 0 && (
+              <div style={{ color: 'var(--text-dim)', fontSize: 12, padding: '10px 0' }}>
+                롤백할 이전 리비전 기록이 없습니다.
+              </div>
+            )}
+            {!revBusy && revisions?.ok && (revisions.revisions || []).length > 0 && (
+              <div style={{ border: '1px solid var(--border)', borderRadius: 6,
+                overflow: 'hidden', maxHeight: 300, overflowY: 'auto', marginBottom: 16 }}>
+                {revisions.revisions.map((rv, i) => {
+                  const sel = rv.revision === selectedRev
+                  return (
+                    <label key={rv.revision} style={{
+                      display: 'block', padding: '9px 12px',
+                      cursor: rv.current ? 'default' : 'pointer',
+                      background: sel ? 'rgba(52,211,153,0.08)' : 'transparent',
+                      borderTop: i > 0 ? '1px solid var(--border)' : 'none',
+                      opacity: rv.current ? 0.65 : 1,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                        <input type="radio" name="polaris-rev" checked={sel} disabled={rv.current}
+                          onChange={() => setSelectedRev(rv.revision)}
+                          style={{ accentColor: 'var(--nimbus)', flexShrink: 0 }} />
+                        <span style={{ fontWeight: 700, fontSize: 12.5, color: 'var(--text-bright)' }}>
+                          리비전 #{rv.revision}
+                        </span>
+                        {rv.current && (
+                          <span style={{ fontSize: 10, color: 'var(--nimbus)',
+                            background: 'rgba(52,211,153,0.12)', padding: '1px 6px',
+                            borderRadius: 3, border: '1px solid rgba(52,211,153,0.25)' }}>
+                            현재
+                          </span>
+                        )}
+                        <span style={{ flex: 1 }} />
+                        <span style={{ fontSize: 10.5, color: 'var(--text-dim)', flexShrink: 0 }}>
+                          {rv.created ? new Date(rv.created).toLocaleString() : ''}{rv.replicas != null ? ` · replicas ${rv.replicas}` : ''}
+                        </span>
+                      </div>
+                      {(rv.images || []).map((img, j) => (
+                        <div key={j} style={{ fontSize: 10.5, color: 'var(--text-mid)',
+                          fontFamily: 'var(--font-mono)', wordBreak: 'break-all', paddingLeft: 24 }}>
+                          {img}
+                        </div>
+                      ))}
+                      {rv.change_cause && (
+                        <div style={{ fontSize: 10.5, color: 'var(--text-dim)',
+                          paddingLeft: 24, marginTop: 2 }}>↳ {rv.change_cause}</div>
+                      )}
+                    </label>
+                  )
+                })}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-ghost btn-sm" onClick={() => setRollbackModal(false)}>취소</button>
+              <button className="btn btn-primary btn-sm" onClick={doRollback}
+                disabled={selectedRev == null || revBusy}>
+                {selectedRev != null ? `#${selectedRev} 로 롤백` : '롤백'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── YAML 편집 모달 (CodeMirror · before/after) ── */}
+      {editMode && yaml?.ok && (
+        <Suspense fallback={
+          <div style={{ position: 'fixed', inset: 0, zIndex: 1100, background: 'rgba(0,0,0,0.62)',
+            display: 'grid', placeItems: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
+            편집기 로딩…
+          </div>
+        }>
+          <YamlEditorModal
+            original={yaml.yaml} kind={kind} namespace={ns} name={name} busy={busy}
+            onApply={requestApply} onClose={cancelEdit}
+          />
+        </Suspense>
+      )}
+
       {/* ── 확인 모달 (apply / scale / restart) ── */}
       {confirm && (
         <div style={{
-          position: 'fixed', inset: 0, zIndex: 1000,
+          position: 'fixed', inset: 0, zIndex: 1200,
           background: 'rgba(0,0,0,0.55)', display: 'grid', placeItems: 'center',
         }} onClick={() => setConfirm(null)}>
           <div onClick={e => e.stopPropagation()} style={{
@@ -870,6 +1011,14 @@ export default function ResourcePanel({ item, kind, onClose, onDelete }) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 내장 파드 셸 (exec) */}
+      {execTarget && (
+        <Suspense fallback={null}>
+          <PodExecModal namespace={execTarget.namespace} pod={execTarget.pod}
+            container={execTarget.container} onClose={() => setExecTarget(null)} />
+        </Suspense>
       )}
     </div>
   )

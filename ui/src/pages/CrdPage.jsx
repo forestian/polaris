@@ -232,6 +232,7 @@ export default function CrdPage() {
       {/* ── 우측: 상세 패널 (객체 선택 시) ── */}
       {picked && (
         <ResourcePanel
+          key={`${crdKind}/${picked.namespace || ''}/${picked.name}`}   // 객체마다 새 패널(v1.5.28 검토 — 앞 객체의 응답이 섞이지 않게)
           item={picked}
           kind={crdKind}
           onClose={() => setPicked(null)}

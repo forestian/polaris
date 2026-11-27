@@ -9,6 +9,8 @@ from src.tools import _find_kubectl, _NO_WINDOW
 from src.k8s import _build_pod_log_args, _normalize_log_source_type, _WORKLOAD_LOG_TYPES
 from src._state import _log_jobs
 
+_MAX_PENDING_LINES = 50_000
+
 
 class LogsMixin:
     def start_log_stream(self, ns: str, name: str, container: str = '',
@@ -17,9 +19,9 @@ class LogsMixin:
         """파드/워크로드/인그레스 로그 스트리밍 시작. job_id 반환."""
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': '연결되지 않음'}
-        kubectl = _find_kubectl()
+        kubectl = _find_kubectl(self.k8s.kubeconfig)
         if not kubectl:
-            return {'ok': False, 'error': 'kubectl을 찾을 수 없습니다.'}
+            return {'ok': False, 'error': _tools_missing()}
 
         # kubeconfig를 지금 캡처 — 클러스터 전환 후 백그라운드 스레드가 잘못된 값을 쓰는 것 방지
         kubeconfig = self.k8s.kubeconfig
@@ -78,6 +80,7 @@ class LogsMixin:
             'error': None,
             'remaining': len(targets),
             'lock': threading.Lock(),
+            'kubeconfig': kubeconfig,
         }
         if header:
             job['lines'].append(header)
@@ -94,6 +97,11 @@ class LogsMixin:
                 )
                 with job['lock']:
                     job['procs'].append(proc)
+                    stopped_early = job['stopped']
+                if stopped_early:
+                    # 등록 전에 [중지] 가 눌렸다 — 예전엔 이 kubectl 이 끝없이 남았다(v1.5.28 검토)
+                    proc.terminate()
+                    return
                 for line in proc.stdout:
                     if job['stopped']:
                         break
@@ -101,7 +109,11 @@ class LogsMixin:
                     if stripped:
                         if prefix:
                             stripped = f'[{target_ns}/{pod_name}] {stripped}'
-                        job['lines'].append(stripped)
+                        with job['lock']:
+                            job['lines'].append(stripped)
+                            # 화면이 가져가지 않는 동안(창 숨김 · 멈춤) 무한히 쌓이지 않게 — 오래된 것부터 버린다
+                            if len(job['lines']) > _MAX_PENDING_LINES:
+                                del job['lines'][:len(job['lines']) - _MAX_PENDING_LINES]
                 proc.wait()
                 if proc.returncode != 0 and not job.get('error'):
                     job['error'] = f'{target_ns}/{pod_name} 로그 스트림이 종료되었습니다. exit={proc.returncode}'
@@ -123,8 +135,13 @@ class LogsMixin:
         job = _log_jobs.get(job_id)
         if not job:
             return {'ok': False, 'error': 'Job not found', 'lines': [], 'stopped': True}
-        lines = job['lines'].copy()
-        job['lines'].clear()
+        with job['lock']:
+            lines = job['lines']
+            job['lines'] = []
+        if job['stopped']:
+            # 끝난 작업은 마지막으로 가져갈 때 지운다 — 예전엔 중지를 누르지 않으면 영영 남았다
+            if all(p.poll() is not None for p in job.get('procs') or []):
+                _log_jobs.pop(job_id, None)
         return {
             'ok':      True,
             'lines':   lines,
@@ -138,8 +155,9 @@ class LogsMixin:
         job = _log_jobs.pop(job_id, None)
         if not job:
             return {'ok': False}
-        job['stopped'] = True
-        procs = list(job.get('procs') or [])
+        with job['lock']:
+            job['stopped'] = True
+            procs = list(job.get('procs') or [])
         if job.get('proc'):
             procs.append(job.get('proc'))
         for proc in procs:
@@ -149,3 +167,16 @@ class LogsMixin:
                 pass
         return {'ok': True}
 
+
+    def _stop_log_streams_for_kubeconfig(self, kubeconfig: str):
+        """클러스터 탭을 닫을 때 그 클러스터의 로그 스트림(kubectl logs -f)도 끝낸다(v1.5.28 검토)."""
+        if not kubeconfig:
+            return
+        for jid, job in list(_log_jobs.items()):
+            if job.get('kubeconfig') == kubeconfig:
+                self.stop_log_stream(jid)
+
+
+def _tools_missing() -> str:
+    from src.tools import KUBECTL_MISSING
+    return KUBECTL_MISSING

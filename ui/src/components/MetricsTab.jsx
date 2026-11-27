@@ -9,6 +9,7 @@
  *   윈도우: 5분 (60p) / 15분 (180p) / 1시간 (720p)
  */
 import React, { useState, useEffect, useRef, useMemo } from 'react'
+import { startPoll } from '../poll.js'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
 import { Cpu, MemoryStick, AlertCircle, Activity } from 'lucide-react'
@@ -279,7 +280,6 @@ export default function MetricsTab({ ns, name }) {
   useEffect(() => {
     if (paused || !windowVisible) return
     cancelRef.current = false
-    let timer = null
 
     async function tick() {
       const res = await api.getPodMetrics(ns, name)
@@ -308,11 +308,10 @@ export default function MetricsTab({ ns, name }) {
       })
     }
 
-    tick()
-    timer = setInterval(tick, POLL_MS)
+    const stop = startPoll(tick, POLL_MS, { immediate: true })
     return () => {
       cancelRef.current = true
-      if (timer) clearInterval(timer)
+      stop()
     }
   }, [ns, name, paused, windowVisible])
 
@@ -578,10 +577,10 @@ export default function MetricsTab({ ns, name }) {
           fontSize: 10.5, color: 'var(--text-mid)',
         }}>
           <div>
-            <span style={{ color: '#fbbf24' }}>req</span> CPU {fmtCpu(reqs.cpu_m)} · MEM {fmtMem(reqs.mem_mi)}
+            <span style={{ color: 'var(--yellow)' }}>req</span> CPU {fmtCpu(reqs.cpu_m)} · MEM {fmtMem(reqs.mem_mi)}
           </div>
           <div>
-            <span style={{ color: '#f87171' }}>lim</span> CPU {fmtCpu(lims.cpu_m)} · MEM {fmtMem(lims.mem_mi)}
+            <span style={{ color: 'var(--red)' }}>lim</span> CPU {fmtCpu(lims.cpu_m)} · MEM {fmtMem(lims.mem_mi)}
           </div>
         </div>
       )}

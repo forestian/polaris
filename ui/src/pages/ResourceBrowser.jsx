@@ -1,9 +1,10 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api.js'
+import { startPoll } from '../poll.js'
 import { useApp } from '../store.jsx'
 import ResourceTable from '../components/ResourceTable.jsx'
 import ResourcePanel from '../components/ResourcePanel.jsx'
-import { RefreshCw, Trash2, X, ChevronDown } from 'lucide-react'
+import { RefreshCw, Trash2, X, ChevronDown, Radio } from 'lucide-react'
 
 // ── 컬럼 정의 ────────────────────────────────────────────────────────────────
 const COLUMNS = {
@@ -173,7 +174,8 @@ function DeleteConfirm({ item, kind, onConfirm, onCancel }) {
 
 // ── 메인 페이지 ──────────────────────────────────────────────────────────────
 export default function ResourceBrowser() {
-  const { connected, namespace, setNamespace, namespaces, activeResource } = useApp()
+  const { connected, namespace, setNamespace, namespaces, activeResource, refreshNamespaces,
+          clusterSwitchKey } = useApp()
   const [rows, setRows]         = useState([])
   const [loading, setLoading]   = useState(false)
   const [selected, setSelected] = useState(null)
@@ -182,24 +184,94 @@ export default function ResourceBrowser() {
   const [deleting, setDeleting]   = useState(false)
   const [toast, setToast]         = useState(null)
 
+  // 실시간 갱신(watch API) — v1: 지원 kind(현재 pods)만. 기본은 꺼짐(명시적 옵트인).
+  const [liveKinds, setLiveKinds] = useState([])
+  const [live, setLive] = useState(false)
+  const watchIdRef = useRef(null)
+  const watchTimerRef = useRef(null)
+
   const kind    = activeResource || 'pods'
   const columns = COLUMNS[kind]  || COLUMNS.pods
   const noNs    = NO_NS_RESOURCES.has(kind)
   const nsParam = noNs ? '' : (namespace === 'All Namespaces' ? '' : namespace)
 
+  // 늦게 온 앞 목록이 새 목록을 덮지 않게(v1.5.28 검토) — Service 목록이 Deployment 제목 아래 남은 채로 [삭제] 하면
+  // 지금 kind(Deployment)의 같은 이름이 지워졌다. 부를 때마다 번호를 올리고, 마지막 번호의 응답만 쓴다
+  const loadSeqRef = useRef(0)
   const load = useCallback(async () => {
     if (!connected) return
+    const seq = ++loadSeqRef.current
     setLoading(true)
     setSelected(null)
     setPanelOpen(false)
-    try {
-      const data = await api.getResource(kind, nsParam)
-      setRows(Array.isArray(data) ? data : [])
-    } catch { setRows([]) }
+    setRows([])
+    let data = null
+    try { data = await api.getResource(kind, nsParam) } catch { data = null }
+    if (seq !== loadSeqRef.current) return
+    setRows(Array.isArray(data) ? data : [])
     setLoading(false)
   }, [connected, kind, nsParam])
 
   useEffect(() => { load() }, [load])
+
+  // 리소스 화면 진입 시 네임스페이스 목록 최신화 — 밖에서 새로 생긴 NS 를 셀렉터에 반영
+  useEffect(() => { refreshNamespaces() }, [refreshNamespaces])
+
+  // watch 지원 kind 목록(현재 pods) — 마운트 시 1회 조회. 백엔드가 나중에 kind 를
+  // 늘려도 프론트 수정 없이 토글이 자동으로 나타난다.
+  useEffect(() => {
+    let alive = true
+    api.resourceWatchKinds().then(r => { if (alive && Array.isArray(r)) setLiveKinds(r) })
+    return () => { alive = false }
+  }, [])
+
+  const canWatch = liveKinds.includes(kind)
+
+  // 실시간 이벤트를 rows 에 반영 — namespace+name 키로 upsert/삭제(watch 는 이미
+  // 서버에서 같은 namespace 로 스코프됨 → 추가 필터 불필요).
+  function applyWatchEvents(events) {
+    if (!events || !events.length) return
+    setRows(prev => {
+      const map = new Map(prev.map(r => [`${r.namespace}::${r.name}`, r]))
+      for (const { type, row } of events) {
+        const key = `${row.namespace}::${row.name}`
+        if (type === 'DELETED') map.delete(key)
+        else map.set(key, row)
+      }
+      return Array.from(map.values())
+    })
+  }
+
+  const stopWatch = useCallback(() => {
+    if (watchTimerRef.current) { watchTimerRef.current(); watchTimerRef.current = null }
+    if (watchIdRef.current) { api.stopResourceWatch(watchIdRef.current); watchIdRef.current = null }
+  }, [])
+
+  // live 토글 또는 kind/namespace/클러스터 변경 시 watch 재시작. off 면 정리만.
+  useEffect(() => {
+    stopWatch()
+    if (!live || !connected || !canWatch) return
+    let cancelled = false
+    ;(async () => {
+      const r = await api.startResourceWatch(kind, nsParam)
+      // 응답 전에 kind·ns 를 바꾸거나 떠났으면 방금 만든 watch 를 닫는다 (v1.3.73 — 남으면
+      // 스레드와 이벤트 버퍼가 앱 종료까지 남았다)
+      if (cancelled) { if (r?.ok && r.watch_id) api.stopResourceWatch(r.watch_id); return }
+      if (!r?.ok) { setLive(false); return }
+      watchIdRef.current = r.watch_id
+      // 겹치지 않는 폴러(v1.3.41) — 이벤트 순서(ADDED→MODIFIED→DELETED)가 뒤집히면 안 된다
+      watchTimerRef.current = startPoll(async () => {
+        const wid = watchIdRef.current
+        if (!wid) return
+        const res = await api.recvResourceWatch(wid)
+        // 응답을 기다리는 사이 kind · ns 가 바뀌었으면(watch 가 바뀌었다) 옛 이벤트를 새 목록에 넣지 않는다(v1.5.28 검토)
+        if (cancelled || watchIdRef.current !== wid) return
+        if (res?.ok) applyWatchEvents(res.events)
+      }, 1000)
+    })()
+    return () => { cancelled = true; stopWatch() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, connected, canWatch, kind, nsParam, clusterSwitchKey])
 
   function handleSelect(row) {
     if (selected === row && panelOpen) {
@@ -300,6 +372,19 @@ export default function ResourceBrowser() {
             <X size={12} /> 패널 닫기
           </button>
         )}
+        {canWatch && (
+          <button className="btn btn-default btn-sm" onClick={() => setLive(v => !v)}
+            title={live ? '실시간 갱신 끄기' : '실시간 갱신 켜기 (kubernetes watch API)'}
+            style={{
+              gap: 4,
+              background: live ? 'rgba(52,211,153,0.15)' : undefined,
+              borderColor: live ? 'var(--nimbus)' : undefined,
+              color: live ? 'var(--nimbus)' : undefined,
+            }}>
+            <Radio size={12} />
+            실시간{live ? ' ON' : ''}
+          </button>
+        )}
         <button className="btn btn-default btn-sm" onClick={load} disabled={loading}>
           <RefreshCw size={12} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
           새로고침
@@ -347,7 +432,10 @@ export default function ResourceBrowser() {
 
         {/* 상세 패널 */}
         {panelOpen && selected && (
+          // key — 다른 객체를 고르면 패널을 새로 만든다(v1.5.28 검토). 늦게 온 앞 객체의 YAML 이 새 객체 이름 아래 남아
+          // [적용] 이 앞 객체를 고치던 것을 막는다(로그 · 이벤트 · 상세도 같은 이유)
           <ResourcePanel
+            key={`${kind}/${selected.namespace || ''}/${selected.name}`}
             item={selected}
             kind={kind}
             onClose={() => setPanelOpen(false)}

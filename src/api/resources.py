@@ -4,9 +4,53 @@ from datetime import datetime, timezone, timedelta
 
 from src.k8s import (
     _is_secret_kind, _argo_primary_source, _argo_sources_from_spec,
-    _build_scale_args, _build_rollout_restart_args,
+    _build_scale_args, _build_rollout_restart_args, _build_rollout_undo_args,
+    _normalize_kubectl_kind, _images_from_cr_data, _kubectl_target_error,
 )
 from src.tools import _run_kubectl
+
+
+# 이벤트를 모을 때 넘겨 볼 최대 개수 (v1.3.41, 성능 P12) — 아래 _list_events_newest 참고
+_EVENT_SCAN_MAX = 3000
+_EVENT_PAGE = 500
+
+
+def _type_selector(type_set):
+    """종류가 하나면 서버에서 거른다 — `type=Warning` 만 받으면 오가는 양이 크게 준다."""
+    if type_set and len(type_set) == 1:
+        (only,) = tuple(type_set)
+        if only in ('Normal', 'Warning'):
+            return f'type={only}'
+    return None
+
+
+def _list_events_newest(fn, limit, field_selector=None, **kw):
+    """이벤트를 **페이지를 넘겨 가며** 모은다.
+
+    (v1.3.41) 예전에는 `limit=500` 으로 한 번만 불렀다. 그런데 쿠버네티스 목록은
+    **이름(키) 순서**라 그 500개는 최신 500개가 아니다 — 이벤트가 많은 클러스터에서는
+    방금 생긴 경고가 목록에 없었고, 그래서 **알림이 새 경고를 놓칠 수 있었다.**
+    이제 _EVENT_SCAN_MAX 까지 이어 받아 호출한 쪽이 시간순으로 정렬해 자른다.
+    """
+    items, cont = [], None
+    while True:
+        args = dict(kw, limit=_EVENT_PAGE)
+        if field_selector:
+            args['field_selector'] = field_selector
+        if cont:
+            args['_continue'] = cont
+        # 모델 변환 없이 읽는다(v1.3.42) — 알림이 15초마다 최대 3000개를 넘겨 본다
+        from src.k8s import _list
+        r = _list(fn, **args)
+        items.extend(r.items or [])
+        cont = getattr(getattr(r, 'metadata', None), '_continue', None)
+        if not cont or len(items) >= max(limit, _EVENT_SCAN_MAX):
+            break
+    return items
+
+
+def _is_forbidden(e) -> bool:
+    return getattr(e, 'status', None) == 403 or ' 403' in str(e)[:40] or 'Forbidden' in str(e)[:200]
 
 
 class ResourcesMixin:
@@ -17,6 +61,84 @@ class ResourcesMixin:
     def get_resource(self, rtype: str, ns: str = ''):
         rows = self.k8s.get_resources(rtype, ns or None)
         return self._clean(rows)
+
+    #: 흔한 단수 · 줄임 표기 → 화면 목록 키(GETTERS). 여기 없는 종류는 kubectl 로 본다.
+    _KIND_ALIASES = {
+        'pod': 'pods', 'po': 'pods', 'deployment': 'deployments', 'deploy': 'deployments',
+        'statefulset': 'statefulsets', 'sts': 'statefulsets', 'daemonset': 'daemonsets', 'ds': 'daemonsets',
+        'replicaset': 'replicasets', 'rs': 'replicasets', 'job': 'jobs', 'cronjob': 'cronjobs', 'cj': 'cronjobs',
+        'service': 'services', 'svc': 'services', 'ingress': 'ingresses', 'ing': 'ingresses',
+        'configmap': 'configmaps', 'cm': 'configmaps', 'secret': 'secrets', 'node': 'nodes', 'no': 'nodes',
+        'namespace': 'namespaces', 'ns': 'namespaces', 'pvc': 'pvcs', 'persistentvolumeclaim': 'pvcs',
+        'persistentvolumeclaims': 'pvcs', 'pv': 'pvs', 'persistentvolume': 'pvs', 'persistentvolumes': 'pvs',
+    }
+    _LIST_ANY_MAX = 2000
+
+    def list_resources_any(self, kind: str, ns: str = '') -> dict:
+        """어떤 종류든 목록 — MCP polaris_list_resources (v1.5.53).
+
+        예전엔 화면 목록용 표(GETTERS 15종)에 없는 종류를 **조용히 0건**으로 돌려줘, CRD(HelmChartConfig · Addon …)
+        와 단수 표기(deployment)가 「하나도 없음」 으로 보였다(사용자 신고 — 실제로 있는 HelmChartConfig 를 없다고 판단).
+        이제 아는 종류는 그대로, 나머지는 `kubectl get <kind> -o json` 으로 본다(이름으로 하나 볼 때와 같은 길).
+        이 길은 **메타데이터만**(이름 · 네임스페이스 · 만든 시각 · apiVersion · kind) 돌려준다 — spec · Secret 값은 싣지 않는다.
+        종류를 모르면 0건이 아니라 오류.
+        """
+        import json as _json
+        k = str(kind or '').strip()
+        key = self._KIND_ALIASES.get(k.lower(), k.lower())
+        if key in self.k8s.GETTERS:
+            return {'ok': True, 'kind': key, 'via': 'api', 'items': self.get_resource(key, ns)}
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '클러스터에 연결되지 않았습니다.'}
+        bad = _kubectl_target_error(kind=k, ns=ns)
+        if bad:
+            return {'ok': False, 'error': bad}
+        args = ['get', k, '-o', 'json'] + (['-n', ns] if ns else ['-A'])
+        out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=60)
+        if not out:
+            msg = (err or '').strip()
+            if "doesn't have a resource type" in msg or 'the server could not find the requested resource' in msg:
+                return {'ok': False, 'error': f'이 클러스터에 「{k}」 종류가 없습니다(CRD 가 설치되지 않았거나 이름이 다름) — {msg[:200]}'}
+            return {'ok': False, 'error': msg[:400] or '목록을 받지 못했습니다'}
+        try:
+            data = _json.loads(out)
+        except ValueError:
+            return {'ok': False, 'error': '목록을 해석하지 못했습니다'}
+        rows = []
+        for it in data.get('items') or []:
+            md = it.get('metadata') or {}
+            rows.append({'name': md.get('name', ''), 'namespace': md.get('namespace', ''),
+                         'kind': it.get('kind', ''), 'apiVersion': it.get('apiVersion', ''),
+                         'created': md.get('creationTimestamp', '')})
+        rows.sort(key=lambda r: (r['namespace'], r['name']))
+        truncated = len(rows) > self._LIST_ANY_MAX
+        return {'ok': True, 'kind': k, 'via': 'kubectl', 'items': rows[:self._LIST_ANY_MAX], 'truncated': truncated,
+                'note': '메타데이터만 — 내용은 polaris_get_resource(이름)로 보세요'}
+
+
+    # ── 리소스 실시간 갱신 (watch API) ───────────────────────────────────────
+    # v1: 파드만 지원(k8s_watch._MAPPERS 참고) — 다른 kind 는 기존 수동 새로고침 그대로.
+    def _res_watch(self):
+        if not hasattr(self, '_polaris_res_watch_mgr'):
+            from src.k8s_watch import ResourceWatchManager
+            self._polaris_res_watch_mgr = ResourceWatchManager()
+        return self._polaris_res_watch_mgr
+
+    def start_resource_watch(self, kind: str, namespace: str = '') -> dict:
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '클러스터에 연결되지 않았습니다.'}
+        return self._res_watch().start(self.k8s.kubeconfig, kind, namespace)
+
+    def recv_resource_watch(self, watch_id: str) -> dict:
+        return self._res_watch().recv(watch_id)
+
+    def stop_resource_watch(self, watch_id: str) -> dict:
+        return self._res_watch().close(watch_id)
+
+    def resource_watch_kinds(self) -> list:
+        """프론트가 '실시간' 토글을 보여줄지 판단하는 지원 kind 목록."""
+        from src.k8s_watch import ResourceWatchManager
+        return ResourceWatchManager.supported_kinds()
 
 
     def get_crds(self):
@@ -209,14 +331,16 @@ class ResourcesMixin:
 
         type_set = set(types) if types else None
         attempts = []
+        fsel = _type_selector(type_set)
 
         # ── 단일 namespace 모드 ─────────────────────────────────────────────
         if namespace:
             try:
-                evts = self.k8s.core.list_namespaced_event(
-                    namespace=namespace, limit=limit).items
+                evts = _list_events_newest(self.k8s.core.list_namespaced_event, limit,
+                                           fsel, namespace=namespace)
                 formatted = self._format_events_core(evts, type_set)
                 formatted.sort(key=lambda r: r.get('last_time') or '', reverse=True)
+                formatted = formatted[:limit]
                 return {
                     'ok': True, 'events': formatted, 'source': 'namespaced',
                     'attempts': [f'list_namespaced_event({namespace})'],
@@ -229,16 +353,28 @@ class ResourcesMixin:
                 }
 
         # ── 전체 NS 모드 ─ Path A: list_event_for_all_namespaces ───────────
-        try:
-            evts = self.k8s.core.list_event_for_all_namespaces(limit=limit).items
-            formatted = self._format_events_core(evts, type_set)
-            formatted.sort(key=lambda r: r.get('last_time') or '', reverse=True)
-            return {
-                'ok': True, 'events': formatted, 'source': 'all-ns',
-                'attempts': ['list_event_for_all_namespaces'],
-            }
-        except Exception as e:
-            attempts.append(f'list_event_for_all_namespaces FAILED: {e}')
+        # 권한이 없어 거절된 클러스터는 기억해 두고 바로 Path B 로 간다 — 예전엔 폴링
+        # (알림 15초 · 이벤트 화면 10초)마다 거절당한 뒤에야 넘어갔다 (v1.3.41)
+        forbidden = getattr(self, '_events_all_ns_forbidden', None)
+        if forbidden is None:
+            forbidden = self._events_all_ns_forbidden = set()
+        cid = getattr(self, '_active_id', None)
+        if cid in forbidden:
+            attempts.append('list_event_for_all_namespaces 건너뜀(이 클러스터는 권한 없음)')
+        else:
+            try:
+                evts = _list_events_newest(self.k8s.core.list_event_for_all_namespaces,
+                                           limit, fsel)
+                formatted = self._format_events_core(evts, type_set)
+                formatted.sort(key=lambda r: r.get('last_time') or '', reverse=True)
+                return {
+                    'ok': True, 'events': formatted[:limit], 'source': 'all-ns',
+                    'attempts': ['list_event_for_all_namespaces'],
+                }
+            except Exception as e:
+                if cid and _is_forbidden(e):
+                    forbidden.add(cid)
+                attempts.append(f'list_event_for_all_namespaces FAILED: {e}')
 
         # ── Path B: 네임스페이스 순회 ───────────────────────────────────────
         try:
@@ -246,17 +382,26 @@ class ResourcesMixin:
             ns_names = [n.metadata.name for n in ns_items]
             attempts.append(f'fallback to per-ns scan ({len(ns_names)} namespaces)')
 
-            # NS당 가져올 양 (전체 한도를 NS 수로 나누되 최소 50, 최대 limit)
-            per_ns_limit = max(50, min(limit, limit // max(len(ns_names), 1) + 50))
+            # 네임스페이스마다 한 번씩 — **동시에** 묻는다 (v1.3.41). 예전엔 하나씩이라
+            # 네임스페이스가 많으면 폴링 한 번이 그 수만큼 왕복을 기다렸다.
+            from concurrent.futures import ThreadPoolExecutor
             all_evts  = []
             failed_ns = []
-            for ns in ns_names:
+            core = self.k8s.core
+
+            def _one(ns):
                 try:
-                    items = self.k8s.core.list_namespaced_event(
-                        namespace=ns, limit=per_ns_limit).items
-                    all_evts.extend(items)
+                    return ns, _list_events_newest(core.list_namespaced_event, limit,
+                                                   fsel, namespace=ns)
                 except Exception:
-                    failed_ns.append(ns)
+                    return ns, None
+
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(ns_names)))) as ex:
+                for ns, items in ex.map(_one, ns_names):
+                    if items is None:
+                        failed_ns.append(ns)
+                    else:
+                        all_evts.extend(items)
 
             formatted = self._format_events_core(all_evts, type_set)
             formatted.sort(key=lambda r: r.get('last_time') or '', reverse=True)
@@ -337,6 +482,10 @@ class ResourcesMixin:
     def delete_resource(self, kind: str, ns: str, name: str):
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': '연결되지 않음'}
+        # 「--all」 같은 이름이 오면 그 네임스페이스를 통째로 지운다 — kubectl 에 넘기기 전에 거른다(v1.5.28 검토)
+        bad = _kubectl_target_error(kind=kind, ns=ns, name=name)
+        if bad:
+            return {'ok': False, 'error': bad}
         try:
             # UI 측 short name(pvcs/pvs 등) 을 kubectl 정식 이름으로 정규화
             kind = self._KUBECTL_KIND_MAP.get(kind, kind)
@@ -345,6 +494,30 @@ class ResourcesMixin:
             if err and 'deleted' not in (out + err).lower():
                 return {'ok': False, 'error': err.strip()}
             return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
+    def patch_resource(self, kind: str, ns: str, name: str, patch: str) -> dict:
+        """kubectl patch --type=merge — CRD 포함 임의 리소스 부분 수정 (velero Schedule 일시정지 등).
+
+        patch: JSON merge patch 문자열, 예: '{"spec":{"paused":true}}'
+        """
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        p = (patch or '').strip()
+        if not p:
+            return {'ok': False, 'error': '패치 내용이 비어 있습니다.'}
+        bad = _kubectl_target_error(kind=kind, ns=ns, name=name)
+        if bad:
+            return {'ok': False, 'error': bad}
+        try:
+            k = self._KUBECTL_KIND_MAP.get(kind, kind)
+            args = (['-n', ns] if ns else []) + ['patch', k, name, '--type=merge', '-p', p]
+            out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
+            if err and 'patched' not in (out + err).lower():
+                return {'ok': False, 'error': err.strip()}
+            return {'ok': True, 'output': (out or err).strip()}
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
@@ -390,6 +563,83 @@ class ResourcesMixin:
             return {'ok': False, 'error': str(e)}
 
 
+    def validate_resource_yaml(self, yaml_text: str) -> dict:
+        """편집 중인 YAML 을 실제 적용 없이 **스키마 검증**한다 (kubectl dry-run).
+
+        서버 dry-run(--dry-run=server) 은 API 서버가 CRD·기본값·admission 까지 포함해
+        검증하므로 클라이언트 문법 검사보다 훨씬 강력하다. 서버 연결이 안 되면
+        클라이언트 dry-run(--dry-run=client, 스키마만)으로 자동 폴백한다.
+
+        반환:
+          {ok:True, valid:True,  mode, message}                 — 통과
+          {ok:True, valid:False, mode, errors:[...], detail}    — 스키마/admission 위반
+          {ok:False, error}                                     — 실행 불가(미연결/kubectl 없음)
+        """
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        text = (yaml_text or '').strip()
+        if not text:
+            return {'ok': False, 'error': '검증할 YAML 이 비어 있습니다.'}
+
+        _CONN_HINTS = ('kubectl을 찾을 수 없', 'unable to connect', 'connection refused',
+                       'no route to host', 'did you specify the right host',
+                       'couldn\'t get current server api group', 'i/o timeout',
+                       'the server could not find the requested resource: openapi')
+
+        def _run(mode):
+            out, err = _run_kubectl(
+                self.k8s.kubeconfig,
+                ['apply', f'--dry-run={mode}', '-f', '-'],
+                timeout=30, stdin_input=text)
+            return out or '', err or ''
+
+        def _looks_ok(out, err):
+            combined = (out + err).lower()
+            return any(w in combined for w in
+                       ('created', 'configured', 'unchanged', 'dry run', 'dry-run'))
+
+        try:
+            out, err = _run('server')
+            # 서버 연결/미지원 문제면 클라이언트 dry-run 으로 폴백
+            if err and not _looks_ok(out, err) and any(h in err.lower() for h in _CONN_HINTS):
+                out2, err2 = _run('client')
+                if _looks_ok(out2, err2):
+                    return {'ok': True, 'valid': True, 'mode': 'client',
+                            'message': out2.strip() or '스키마 검증 통과 (클라이언트 dry-run)'}
+                if err2.strip():
+                    return {'ok': True, 'valid': False, 'mode': 'client',
+                            'errors': self._split_kubectl_errors(err2), 'detail': err2.strip()}
+                # 클라이언트도 실행 자체 실패 → 실행 불가로 보고
+                return {'ok': False, 'error': (err.strip() or err2.strip())[:600]}
+
+            if _looks_ok(out, err):
+                return {'ok': True, 'valid': True, 'mode': 'server',
+                        'message': out.strip() or '스키마 검증 통과 (서버 dry-run)'}
+            if err.strip():
+                return {'ok': True, 'valid': False, 'mode': 'server',
+                        'errors': self._split_kubectl_errors(err), 'detail': err.strip()}
+            # stderr 없고 성공 토큰도 없음 — 보수적으로 통과 처리
+            return {'ok': True, 'valid': True, 'mode': 'server',
+                    'message': out.strip() or '스키마 검증 완료'}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    @staticmethod
+    def _split_kubectl_errors(stderr: str) -> list:
+        """kubectl dry-run stderr 를 사람이 읽는 오류 줄 목록으로 분해."""
+        lines = []
+        for raw in (stderr or '').splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            # 진행 로그/버전 다운로드 잡음 제거
+            if s.lower().startswith(('downloading', 'verifying', 'info[')):
+                continue
+            lines.append(s[:500])
+        # 너무 많으면 앞쪽 위주로
+        return lines[:40]
+
+
     def scale_resource(self, kind: str, ns: str, name: str, replicas) -> dict:
         """kubectl scale — Deployment/StatefulSet/ReplicaSet 의 replicas 변경."""
         if not self.k8s.kubeconfig:
@@ -424,10 +674,174 @@ class ResourcesMixin:
             return {'ok': False, 'error': str(e)}
 
 
+    def get_rollout_revisions(self, kind: str, ns: str, name: str) -> dict:
+        """워크로드 리비전 목록 — 사용자가 "언제/무엇으로 되돌릴지" 보고 고르게 한다.
+
+        각 리비전: 번호 · 생성 시각 · 컨테이너 이미지 · replicas · 현재 활성 여부 · change-cause.
+          - Deployment           : ReplicaSet 기반 (revision 주석 + spec.template).
+          - StatefulSet/DaemonSet : ControllerRevision 기반 (cr.revision + cr.data 템플릿).
+            CR 은 파드 수 정보가 없어 replicas/ready = None (UI 에서 해당 칸 생략).
+        """
+        if not self.k8s.connected or self.k8s.apps is None:
+            return {'ok': False, 'error': '연결되지 않음'}
+        # _normalize_kubectl_kind 는 복수형을 반환한다('deployment'→'deployments').
+        k = _normalize_kubectl_kind(kind)
+        try:
+            if k == 'deployments':
+                return self._revisions_deployment(ns, name)
+            if k == 'statefulsets':
+                return self._revisions_statefulset(ns, name)
+            if k == 'daemonsets':
+                return self._revisions_daemonset(ns, name)
+            return {'ok': False,
+                    'error': '리비전 롤백은 Deployment/StatefulSet/DaemonSet 만 지원합니다.'}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def _revisions_deployment(self, ns: str, name: str) -> dict:
+        """Deployment 리비전 — 소유 ReplicaSet 들의 revision 주석 + 템플릿."""
+        dep = self.k8s.apps.read_namespaced_deployment(name, ns)
+        cur_ann = (dep.metadata.annotations or {}).get('deployment.kubernetes.io/revision')
+        cur = int(cur_ann) if cur_ann and str(cur_ann).isdigit() else None
+        dep_uid = dep.metadata.uid
+        revs = []
+        for rs in self.k8s.apps.list_namespaced_replica_set(ns).items:
+            if not any(o.uid == dep_uid for o in (rs.metadata.owner_references or [])):
+                continue
+            ann = rs.metadata.annotations or {}
+            rev = ann.get('deployment.kubernetes.io/revision')
+            if not rev or not str(rev).isdigit():
+                continue
+            rev = int(rev)
+            tmpl = rs.spec.template.spec if (rs.spec and rs.spec.template) else None
+            imgs = [c.image for c in (tmpl.containers or [])] if tmpl else []
+            ts = rs.metadata.creation_timestamp
+            revs.append({
+                'revision':     rev,
+                'created':      ts.isoformat() if ts else '',
+                'images':       imgs,
+                'replicas':     rs.spec.replicas or 0,
+                'ready':        (rs.status.ready_replicas or 0) if rs.status else 0,
+                'change_cause': ann.get('kubernetes.io/change-cause', ''),
+                'current':      (rev == cur),
+            })
+        revs.sort(key=lambda r: r['revision'], reverse=True)
+        return {'ok': True, 'current': cur, 'revisions': revs}
+
+    def _revisions_statefulset(self, ns: str, name: str) -> dict:
+        """StatefulSet 리비전 — ControllerRevision 기반.
+        현재 = status.updateRevision(최신 desired) → 없으면 currentRevision (CR 이름)."""
+        sts = self.k8s.apps.read_namespaced_stateful_set(name, ns)
+        cur_name = None
+        if sts.status:
+            cur_name = sts.status.update_revision or sts.status.current_revision
+        return self._revisions_from_crs(ns, sts.metadata.uid, current_cr_name=cur_name)
+
+    def _revisions_daemonset(self, ns: str, name: str) -> dict:
+        """DaemonSet 리비전 — ControllerRevision 기반.
+        DaemonSet status 에는 current/update revision 필드가 없어, 최고 revision 을 현재로 본다."""
+        ds = self.k8s.apps.read_namespaced_daemon_set(name, ns)
+        return self._revisions_from_crs(ns, ds.metadata.uid, current_is_max=True)
+
+    def _revisions_from_crs(self, ns: str, owner_uid: str,
+                            current_cr_name=None, current_is_max=False) -> dict:
+        """StatefulSet/DaemonSet 공통 — 소유 ControllerRevision 들을 리비전 목록으로.
+
+        replicas/ready 는 CR 에 없으므로 None(템플릿 스냅샷이라 파드 수 개념 없음).
+        현재 리비전은 CR 이름 매칭(sts) 또는 최고 revision(ds) 으로 표시.
+        """
+        revs, max_rev = [], None
+        for cr in self.k8s.apps.list_namespaced_controller_revision(ns).items:
+            if not any(o.uid == owner_uid for o in (cr.metadata.owner_references or [])):
+                continue
+            rev = getattr(cr, 'revision', None)
+            try:
+                rev = int(rev)
+            except (TypeError, ValueError):
+                continue
+            max_rev = rev if max_rev is None else max(max_rev, rev)
+            ts = cr.metadata.creation_timestamp
+            revs.append({
+                '_cr_name':     cr.metadata.name,
+                'revision':     rev,
+                'created':      ts.isoformat() if ts else '',
+                'images':       _images_from_cr_data(getattr(cr, 'data', None)),
+                'replicas':     None,   # ControllerRevision 은 파드 수 정보 없음
+                'ready':        None,
+                'change_cause': (cr.metadata.annotations or {}).get('kubernetes.io/change-cause', ''),
+                'current':      False,
+            })
+        cur_num = None
+        for r in revs:
+            if current_is_max:
+                r['current'] = (r['revision'] == max_rev)
+            elif current_cr_name:
+                r['current'] = (r['_cr_name'] == current_cr_name)
+            if r['current']:
+                cur_num = r['revision']
+            del r['_cr_name']
+        revs.sort(key=lambda r: r['revision'], reverse=True)
+        return {'ok': True, 'current': cur_num, 'revisions': revs}
+
+
+    def rollout_undo(self, kind: str, ns: str, name: str, revision) -> dict:
+        """kubectl rollout undo --to-revision — 지정 리비전으로 롤백."""
+        if not self.k8s.kubeconfig:
+            return {'ok': False, 'error': '연결되지 않음'}
+        try:
+            args = _build_rollout_undo_args(kind, ns, name, revision)
+        except ValueError as e:
+            return {'ok': False, 'error': str(e)}
+        try:
+            out, err = _run_kubectl(self.k8s.kubeconfig, args, timeout=30)
+            blob = (out + err).lower()
+            if err and 'rolled back' not in blob and 'rolling back' not in blob:
+                return {'ok': False, 'error': err.strip()}
+            return {'ok': True, 'output': (out or err).strip()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+
     def get_dashboard(self):
         data = self.k8s.get_dashboard_data()
         data['pods'] = self._clean(data.get('pods', []))
+        data['readyz'] = self._dashboard_readyz()
         return data
+
+    def _dashboard_readyz(self) -> dict:
+        """컨트롤 플레인 준비 상태 (`/readyz?verbose=true`) — 호출 1회.
+
+        **fail-open 이다.** 클러스터 정책상 `/readyz` 가 403/404 일 수 있는데, 못 읽은
+        것을 장애로 표시하면 멀쩡한 클러스터를 문제라고 신고하게 된다. 그 경우
+        `available: False` 로 두고 화면은 「확인 불가」로 처리한다.
+
+        readyz 수집 자체는 보고서(_report_fetch_readyz)와 공유한다 — 판정 기준이
+        화면과 문서에서 갈리면 안 된다. reports 는 src.k8s 만 의존하므로
+        여기서 import 해도 순환이 생기지 않는다.
+        """
+        if not getattr(self.k8s, 'connected', False):
+            return {'available': False, 'reason': '연결되지 않음'}
+        try:
+            from src.reports import _report_fetch_readyz
+            r = _report_fetch_readyz(self.k8s)
+        except Exception as e:
+            return {'available': False, 'reason': f'{type(e).__name__}: {e}'}
+
+        # status 가 없으면 응답 자체를 못 받은 것 → 확인 불가
+        if not r.get('status'):
+            return {'available': False,
+                    'reason': r.get('error') or '응답 없음'}
+        if r.get('status') in (401, 403, 404):
+            return {'available': False,
+                    'reason': f"HTTP {r['status']} — 이 클러스터는 /readyz 조회가 제한됩니다"}
+        return {
+            'available': True,
+            'ok':        bool(r.get('ok')),
+            'status':    r.get('status'),
+            'total':     len(r.get('checks') or []) + len(r.get('failed') or []),
+            'passed':    len(r.get('checks') or []),
+            'failed':    r.get('failed') or [],
+        }
 
 
     def get_argocd_apps(self):

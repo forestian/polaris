@@ -1,6 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo, useDeferredValue, memo } from 'react'
 import { api } from '../api.js'
+import { startPoll } from '../poll.js'
 import { useApp } from '../store.jsx'
+import AiDiagnoseButton from '../components/AiDiagnose.jsx'
 import {
   LOG_SOURCE_OPTIONS,
   buildLogStreamArgs,
@@ -21,6 +23,16 @@ function lineColor(line) {
   if (/\b(warn(ing)?)\b/.test(lo)) return 'var(--yellow)'
   if (/\b(debug|trace)\b/.test(lo)) return 'var(--text-dim)'
   return 'var(--text)'
+}
+
+// AI 진단으로 보낼 로그 텍스트 정리. 인그레스 access log 등에는 공격 탐침의 바이너리/제어문자가
+// 섞여(예: \x00) JS→Python 브리지 직렬화를 깨 text 가 비어 전달되곤 했다.
+// 제어문자(탭·개행 제외) 제거 + 크기 캡(백엔드가 어차피 추가 트림). 빈 줄 배열도 안전 처리.
+function logTextForAi(lines) {
+  const recent = (Array.isArray(lines) ? lines : []).slice(-1200)
+  return recent.join('\n')
+    .replace(/[\u0000-\u001F]/g, c => (c === '\t' || c === '\n' || c === '\r') ? c : '')
+    .slice(-80000)
 }
 
 function Sel({ value, onChange, children, style, disabled = false }) {
@@ -57,6 +69,22 @@ function Toggle({ value, onChange, label }) {
   )
 }
 
+// 로그 한 줄 (v1.3.42, 성능 P9) — 같은 글·같은 필터면 다시 그리지 않는다.
+// `content-visibility: auto` 로 화면 밖 줄은 브라우저가 배치·그리기를 건너뛴다
+// (줄마다 높이가 달라 고정 높이 창 방식은 맞지 않는다). 예전엔 800ms 마다 1만 줄을
+// 전부 다시 배치했다.
+const LOG_LINE_STYLE_BASE = {
+  whiteSpace: 'pre-wrap', wordBreak: 'break-all', padding: '0 2px',
+  contentVisibility: 'auto', containIntrinsicSize: 'auto 20px',
+}
+const LogLine = memo(function LogLine({ text, color, filter }) {
+  return (
+    <div style={{ ...LOG_LINE_STYLE_BASE, color }}>
+      {filter ? highlightFilter(text, filter) : text}
+    </div>
+  )
+})
+
 function highlightFilter(line, filter) {
   if (!filter) return line
   const idx = line.toLowerCase().indexOf(filter.toLowerCase())
@@ -84,7 +112,13 @@ export default function LogPage() {
   const [tail, setTail] = useState(200)
   const [follow, setFollow] = useState(false)
 
+  // lines: [{id, text, color}] — id 는 단조증가 카운터(react key 로 사용). 버퍼 상한 초과 시
+  // 앞쪽을 잘라내는데, 예전엔 배열 인덱스를 key 로 써서 잘릴 때마다 남은 줄 전부의 key 가
+  // 밀려 React 가 "전부 새 노드"로 보고 1만 줄을 통째로 재마운트했다(스트리밍 중 0.8초마다).
+  // 안정적 id 를 쓰면 유지되는 줄은 React 가 기존 DOM 을 그대로 재사용한다. color 도 수신
+  // 시점에 1회만 계산해 렌더마다(줄당 정규식 3회) 반복 안 하도록 저장.
   const [lines, setLines] = useState([])
+  const lineIdRef = useRef(0)
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState(false)
   const [errMsg, setErrMsg] = useState('')
@@ -109,7 +143,7 @@ export default function LogPage() {
     setCtr(logTarget.container || '')
     setTail(Number(logTarget.tail) || 200)
     setFollow(false)
-    setLines([])
+    setLines([]); lineIdRef.current = 0
     setErrMsg('')
     setDone(false)
   }, [logTarget])
@@ -169,9 +203,9 @@ export default function LogPage() {
   }, [ns, pod, sourceType, logTarget])
 
   useEffect(() => {
-    if (autoScroll && logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: 'auto' })
-    }
+    // scrollIntoView 는 조상 스크롤까지 계산한다 — 상자 하나만 내리면 된다 (v1.3.42)
+    const box = logBoxRef.current
+    if (autoScroll && box) box.scrollTop = box.scrollHeight
   }, [lines, autoScroll])
 
   function handleScroll() {
@@ -183,7 +217,7 @@ export default function LogPage() {
 
   const stopStream = useCallback(async () => {
     if (pollRef.current) {
-      clearInterval(pollRef.current)
+      pollRef.current()          // startPoll 의 stop (v1.3.41)
       pollRef.current = null
     }
     if (jobRef.current) {
@@ -193,12 +227,16 @@ export default function LogPage() {
     setRunning(false)
   }, [])
 
-  useEffect(() => () => { stopStream() }, [stopStream])
+  // 시작 요청이 돌아오기 전에 화면을 떠나거나 다시 시작하면, 늦게 온 작업을 닫는다 (v1.3.73).
+  // 예전엔 그 job 이 백엔드에 남고, 떠난 화면이 0.8초 폴링까지 시작했다.
+  const startGenRef = useRef(0)
+  useEffect(() => () => { startGenRef.current += 1; stopStream() }, [stopStream])
 
   async function startStream() {
     if (!canStartLogStream({ connected, sourceType, namespace: ns, target: pod })) return
+    const gen = ++startGenRef.current
     await stopStream()
-    setLines([])
+    setLines([]); lineIdRef.current = 0
     setErrMsg('')
     setDone(false)
     setRunning(true)
@@ -213,17 +251,28 @@ export default function LogPage() {
       follow,
     })
     const res = await api.startLogStream(...args)
+    if (gen !== startGenRef.current) {            // 그 사이 떠났거나 다시 시작했다
+      if (res?.ok && res.job_id) { try { await api.stopLogStream(res.job_id) } catch { /* 이미 끝남 */ } }
+      return
+    }
     if (!res?.ok) {
       setErrMsg(res?.error || '시작 실패')
       setRunning(false)
       return
     }
     jobRef.current = res.job_id
+    const jid = res.job_id
 
-    pollRef.current = setInterval(async () => {
+    // 겹치지 않는 폴러(v1.3.41) — setInterval 이면 느린 응답 뒤에 다음 호출이 겹쳐,
+    // 읽으면 비워지는 로그가 **순서가 뒤바뀐 채** 붙을 수 있었다.
+    pollRef.current = startPoll(async () => {
       // 트레이로 hide된 상태면 폴링 스킵 (백엔드 job은 살림)
       if (!visibleRef.current) return
-      const chunk = await api.getLogChunk(jobRef.current)
+      if (jobRef.current !== jid) return false
+      const chunk = await api.getLogChunk(jid)
+      // 기다리는 사이 [중지] · 다시 시작했다 — 지난 작업의 줄을 새 화면에 붙이거나 새 작업을 끝난 것으로
+      // 표시하지 않는다(v1.5.28 검토)
+      if (jobRef.current !== jid) return false
       if (!chunk?.ok) {
         await stopStream()
         return
@@ -231,7 +280,10 @@ export default function LogPage() {
 
       if (chunk.lines?.length > 0) {
         setLines(prev => {
-          const merged = [...prev, ...chunk.lines]
+          const appended = chunk.lines.map(text => ({
+            id: lineIdRef.current++, text, color: lineColor(text),
+          }))
+          const merged = [...prev, ...appended]
           return merged.length > 10000 ? merged.slice(merged.length - 10000) : merged
         })
       }
@@ -239,11 +291,11 @@ export default function LogPage() {
       if (chunk.error && !errMsg) setErrMsg(chunk.error)
 
       if (chunk.stopped) {
-        clearInterval(pollRef.current)
         pollRef.current = null
         jobRef.current = null
         setRunning(false)
         setDone(true)
+        return false
       }
     }, 800)
   }
@@ -267,7 +319,7 @@ export default function LogPage() {
   }, [logTarget, connected, sourceType, ns, pod, ctr])
 
   async function copyAll() {
-    const text = filtered.join('\n')
+    const text = filtered.map(l => l.text).join('\n')
     try {
       await navigator.clipboard.writeText(text)
       setCopied(true)
@@ -276,16 +328,20 @@ export default function LogPage() {
   }
 
   async function downloadAll() {
-    const text = filtered.join('\n')
+    const text = filtered.map(l => l.text).join('\n')
     if (!text) return
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
     const base = String(pod || sourceType || 'logs').replace(/[^\w.-]/g, '_')
     await api.saveTextFile(text, `${base}-${stamp}.log`)
   }
 
-  const filtered = filter
-    ? lines.filter(line => line.toLowerCase().includes(filter.toLowerCase()))
-    : lines
+  // 입력은 바로, 1만 줄 거르기는 한 박자 뒤에 — 타이핑이 밀리지 않게 (v1.3.42)
+  const deferredFilter = useDeferredValue(filter)
+  const filtered = useMemo(() => {
+    if (!deferredFilter) return lines
+    const needle = deferredFilter.toLowerCase()
+    return lines.filter(l => l.text.toLowerCase().includes(needle))
+  }, [lines, deferredFilter])
 
   const canStart = canStartLogStream({ connected, sourceType, namespace: ns, target: pod })
   const targetLabel = isPodLogSource(sourceType) ? '파드' : '워크로드'
@@ -309,7 +365,7 @@ export default function LogPage() {
           setSourceType(value)
           setPod('')
           setCtr('')
-          setLines([])
+          setLines([]); lineIdRef.current = 0
           setErrMsg('')
           setDone(false)
         }} style={{ width: 145 }}>
@@ -414,7 +470,14 @@ export default function LogPage() {
           다운로드
         </button>
 
-        <button className="btn btn-ghost btn-sm" onClick={() => setLines([])}
+        <AiDiagnoseButton source="logs" disabled={filtered.length === 0}
+          title="현재 로그를 LLM 으로 진단/질의"
+          getPayload={() => ({
+            namespace: ns, pod, container: ctr,
+            text: logTextForAi(filtered.map(l => l.text)),
+          })} />
+
+        <button className="btn btn-ghost btn-sm" onClick={() => { setLines([]); lineIdRef.current = 0 }}
           disabled={lines.length === 0} style={{ gap: 4 }}>
           <Trash2 size={11} />
           지우기
@@ -465,15 +528,8 @@ export default function LogPage() {
           </div>
         )}
 
-        {filtered.map((line, i) => (
-          <div key={i} style={{
-            color: lineColor(line),
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-all',
-            padding: '0 2px',
-          }}>
-            {filter ? highlightFilter(line, filter) : line}
-          </div>
+        {filtered.map(l => (
+          <LogLine key={l.id} text={l.text} color={l.color} filter={deferredFilter} />
         ))}
 
         {running && (

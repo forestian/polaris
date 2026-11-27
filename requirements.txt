@@ -1,8 +1,13 @@
-kubernetes>=26.1.0
-pywebview>=4.0
-python-docx>=1.1.2
-pyinstaller>=6.0
-pystray>=0.19
-Pillow>=12.2.0
-cryptography>=48.0.0
-paramiko>=5.0.0
+# v1.2.88 빌드에서 실제로 검증된 버전으로 핀 고정(==). 예전엔 >= 하한만 있어 새 venv 마다
+# 다른 버전이 설치될 수 있었다(예: Pillow 는 요구사항이 >=12.2.0 인데 실제 빌드 환경엔 12.1.1 이
+# 설치돼 있었음 — 하한 미충족 드리프트를 아무도 눈치 못 채고 있었던 사례). 간접 의존성(bcrypt,
+# cffi, PyNaCl 등)은 핀 고정하지 않음 — 별도 락파일(pip-compile) 도입은 더 큰 프로세스 변경이라
+# 이번엔 직접 의존성만 고정. 버전 올릴 땐 이 파일을 의도적으로 갱신.
+kubernetes==35.0.0
+pywebview==6.2.1
+python-docx==1.2.0
+pyinstaller==6.20.0
+pystray==0.19.5
+Pillow==12.1.1
+cryptography==48.0.0
+mcp==1.28.1

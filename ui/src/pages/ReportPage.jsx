@@ -1,7 +1,10 @@
+import CheckPageHead from '../components/CheckPageHead.jsx'
 import React, { useState, useRef, useEffect } from 'react'
 import { api } from '../api.js'
+import { startPoll, appendCapped } from '../poll.js'
 import { useApp } from '../store.jsx'
-import { FileText, Download, ChevronDown, Bot, Check, ChevronRight } from 'lucide-react'
+import { FileText, Download, ChevronDown, Bot, Check, ChevronRight, Network } from 'lucide-react'
+import LlmConnectionTest from '../components/LlmConnectionTest.jsx'
 
 const SECTIONS = [
   { key: 'nodes',       label: '노드',           desc: '노드 상태, 역할, 리소스 용량' },
@@ -10,6 +13,9 @@ const SECTIONS = [
   { key: 'services',    label: '서비스',         desc: '서비스 타입 및 포트 정보' },
   { key: 'events',      label: '이벤트',         desc: '경고/오류 이벤트 목록' },
   { key: 'resources',   label: '리소스 요약',    desc: 'CPU/메모리 할당 현황' },
+  // 체크를 풀면 RBAC 구성 표와 과도 권한 경고가 보고서에서 모두 빠진다.
+  // 권한 정리는 단기간에 끝나는 일이 아니라 매 보고서에 실을 필요가 없다는 요청.
+  { key: 'rbac',        label: 'RBAC 권한',      desc: 'RBAC 구성 표 + 과도 권한 경고 (해제 시 전부 제외)' },
 ]
 
 // LLM URL 이 로컬(localhost / 127.0.0.1 / ::1) 인지 판별 — 외부 URL 사용 시 UI 경고용
@@ -55,9 +61,11 @@ export default function ReportPage() {
   const [sections, setSections] = useState(
     Object.fromEntries(SECTIONS.map(s => [s.key, true]))
   )
+  const [netScan, setNetScan]   = useState(false)   // 네트워크 스캔 포함 (10장 생성)
   const [useAI, setUseAI]       = useState(false)
   const [llmUrl, setLlmUrl]     = useState('http://localhost:1234')
   const [llmModel, setLlmModel] = useState('local-model')
+  const [llmModels, setLlmModels] = useState([])   // testLlmConnection 결과 모델 목록
   const [loading, setLoading]   = useState(false)
   const [logs, setLogs]         = useState([])
   const [status, setStatus]     = useState(null)
@@ -69,20 +77,34 @@ export default function ReportPage() {
   }, [logs])
 
   useEffect(() => {
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    return () => { if (pollRef.current) pollRef.current() }   // startPoll 의 stop
   }, [])
 
   function toggleSection(key) {
     setSections(prev => ({ ...prev, [key]: !prev[key] }))
   }
 
+  // LlmConnectionTest 가 모델 목록을 받아오면 datalist 를 채우고, 값이 기본/빈값이면 첫 모델로 채움
+  function handleLlmModels(models) {
+    setLlmModels(models)
+    if (models.length && (!llmModel || llmModel === 'local-model')) {
+      setLlmModel(models[0])
+    }
+  }
+
   async function generate() {
-    if (pollRef.current) clearInterval(pollRef.current)
+    if (pollRef.current) { pollRef.current(); pollRef.current = null }
     setLoading(true)
     setLogs([])
     setStatus(null)
 
-    const filename = `Polaris-report-${new Date().toISOString().slice(0, 10)}.docx`
+    // 기본 파일명은 백엔드가 만든다 — 클러스터 별명 선택 규칙(display_name 우선)이
+    // 이미 거기 있고, 프론트에서 다시 구현하면 두 곳이 어긋난다.
+    let filename = `Polaris-report-${new Date().toISOString().slice(0, 10)}.docx`
+    try {
+      const suggested = await api.defaultReportFilename()
+      if (typeof suggested === 'string' && suggested) filename = suggested
+    } catch { /* 미연결 등 — 날짜만 들어간 기본값을 그대로 쓴다 */ }
     let savePath
     try {
       savePath = await api.openSaveDialog(filename)
@@ -101,6 +123,7 @@ export default function ReportPage() {
         llm_url:   llmUrl,
         llm_model: llmModel,
         sections:  Object.entries(sections).filter(([, v]) => v).map(([k]) => k),
+        netscan:   netScan,
       })
     } catch (e) {
       setStatus({ ok: false, msg: String(e) }); setLoading(false); return
@@ -111,22 +134,24 @@ export default function ReportPage() {
     }
 
     const jobId = res.job_id
-    pollRef.current = setInterval(async () => {
+    // 겹치지 않는 폴러(v1.3.41). 리포트는 창을 숨겨도 계속 만들어진다 — 다시 보이면 이어 받는다
+    pollRef.current = startPoll(async () => {
       try {
         const s = await api.getJobStatus(jobId)
-        if (s.logs) setLogs([...s.logs])
+        // 백엔드가 이전 호출 이후 새로 쌓인 만큼만 보내므로(drain) 누적 추가
+        if (s.logs?.length > 0) setLogs(prev => appendCapped(prev, s.logs, 3000))
         if (s.status === 'done') {
-          clearInterval(pollRef.current)
           setStatus({ ok: true, msg: `저장 완료: ${s.path || savePath}` })
           setLoading(false)
+          return false
         } else if (s.status === 'error') {
-          clearInterval(pollRef.current)
           setStatus({ ok: false, msg: s.error || '오류 발생' })
           setLoading(false)
+          return false
         }
       } catch (e) {
-        clearInterval(pollRef.current)
         setStatus({ ok: false, msg: String(e) }); setLoading(false)
+        return false
       }
     }, 1000)
   }
@@ -156,12 +181,7 @@ export default function ReportPage() {
           padding: '10px 20px', borderBottom: '1px solid var(--border)',
           background: 'var(--bg-1)', flexShrink: 0,
         }}>
-          <FileText size={15} color="var(--nimbus)" />
-          <h1 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-bright)', margin: 0 }}>
-            클러스터 보고서
-          </h1>
-          <span style={{ flex: 1 }} />
-          <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>DOCX(Word) 형식으로 저장</span>
+          <CheckPageHead page="report" icon={FileText} style={{ marginBottom: 0, flex: 1 }} />
         </div>
 
         {/* 스텝 헤더 */}
@@ -287,6 +307,38 @@ export default function ReportPage() {
                 LLM 연동 시 수집된 데이터를 AI가 분석하여 요약과 권장사항을 추가합니다.
               </div>
 
+              {/* 네트워크 스캔 토글 — 켜면 보고서에 「10. 네트워크 스캔」 장이 추가된다 */}
+              <div style={{
+                background: netScan ? 'rgba(52,211,153,0.06)' : 'var(--bg-2)',
+                border: `1px solid ${netScan ? 'rgba(52,211,153,0.3)' : 'var(--border)'}`,
+                borderRadius: 8, padding: '14px 16px', marginBottom: 16,
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={netScan} onChange={e => setNetScan(e.target.checked)}
+                    style={{ accentColor: 'var(--nimbus)', width: 14, height: 14 }} />
+                  <Network size={14} color={netScan ? 'var(--nimbus)' : 'var(--text-dim)'} />
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: netScan ? 'var(--text-bright)' : 'var(--text)' }}>
+                      네트워크 스캔 포함
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                      Service·Ingress 정합성 · 도달성 · TLS 인증서 만료를 점검해 보고서에
+                      「10. 네트워크 스캔」 장을 추가합니다
+                      {' · '}<span style={{ color: 'var(--yellow)' }}>생성 시간 10~30초 추가</span>
+                    </div>
+                  </div>
+                </label>
+                {netScan && (
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10,
+                    paddingLeft: 24, lineHeight: 1.55 }}>
+                    클러스터에 아무것도 배포하지 않고 API 서버를 경유해 점검합니다. 시스템
+                    네임스페이스는 제외하며, 대상이 많으면 생성 시간이 늘어납니다.
+                    <br />
+                    ClusterIP·kube-proxy 경로와 파드 간 통신(NetworkPolicy·CNI)은 점검 범위가 아닙니다.
+                  </div>
+                )}
+              </div>
+
               {/* AI 토글 */}
               <div style={{
                 background: useAI ? 'rgba(52,211,153,0.06)' : 'var(--bg-2)',
@@ -311,9 +363,12 @@ export default function ReportPage() {
                   <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
                     <div>
                       <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>LLM API URL</div>
-                      <input className="input" value={llmUrl} onChange={e => setLlmUrl(e.target.value)}
-                        placeholder="http://localhost:1234"
-                        style={{ width: '100%', fontSize: 12, fontFamily: 'var(--font-mono)' }} />
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <input className="input" value={llmUrl} onChange={e => setLlmUrl(e.target.value)}
+                          placeholder="http://localhost:1234"
+                          style={{ flex: 1, minWidth: 0, fontSize: 12, fontFamily: 'var(--font-mono)' }} />
+                        <LlmConnectionTest url={llmUrl} onModels={handleLlmModels} />
+                      </div>
                       <div style={{
                         fontSize: 10.5,
                         color: isLocalLlmUrl(llmUrl) ? 'var(--text-dim)' : '#f59e0b',
@@ -328,8 +383,13 @@ export default function ReportPage() {
                     <div>
                       <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>모델명</div>
                       <input className="input" value={llmModel} onChange={e => setLlmModel(e.target.value)}
-                        placeholder="local-model"
+                        placeholder="local-model" list="polaris-llm-models"
                         style={{ width: '100%', fontSize: 12, fontFamily: 'var(--font-mono)' }} />
+                      {llmModels.length > 0 && (
+                        <datalist id="polaris-llm-models">
+                          {llmModels.map(m => <option key={m} value={m} />)}
+                        </datalist>
+                      )}
                     </div>
                   </div>
                 )}
@@ -342,6 +402,9 @@ export default function ReportPage() {
                   <div>대상: <span style={{ color: 'var(--text)' }}>{namespace}</span></div>
                   <div>섹션: <span style={{ color: 'var(--text)' }}>
                     {SECTIONS.filter(s => sections[s.key]).map(s => s.label).join(', ') || '없음'}
+                  </span></div>
+                  <div>네트워크 스캔: <span style={{ color: netScan ? 'var(--nimbus)' : 'var(--text)' }}>
+                    {netScan ? '포함 (10장 추가)' : '미포함'}
                   </span></div>
                   <div>AI 분석: <span style={{ color: useAI ? 'var(--nimbus)' : 'var(--text)' }}>{useAI ? '포함' : '미포함'}</span></div>
                 </div>

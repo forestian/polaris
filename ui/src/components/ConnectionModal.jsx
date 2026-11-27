@@ -1,10 +1,10 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 import { useApp } from '../store.jsx'
 import { api } from '../api.js'
-import { FolderOpen, X, Loader, Check } from 'lucide-react'
+import { FolderOpen, X, Loader, Check, Archive } from 'lucide-react'
 
 export default function ConnectionModal() {
-  const { setShowConnect, addCluster } = useApp()
+  const { setShowConnect, addCluster, connectFromVault } = useApp()
 
   const [path, setPath]           = useState('')
   const [ctxList, setCtxList]     = useState(null)   // null=미조회 | string[]
@@ -13,6 +13,26 @@ export default function ConnectionModal() {
   const [ctxLoading, setCtxLoading] = useState(false)
   const [connecting, setConnecting] = useState(false)
   const [error, setError]         = useState('')
+  const [savedList, setSavedList] = useState([])     // vault 보관 kubeconfig 이름들
+  const [vaultBusy, setVaultBusy] = useState(false)
+
+  // ── 보관함(vault)에 저장된 kubeconfig 목록 로드 (잠금 해제 + 항목 있을 때만 노출) ──
+  useEffect(() => {
+    let alive = true
+    api.listKubeconfigs()
+      .then(r => { if (alive && r?.ok) setSavedList(r.items || []) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  // ── 보관본으로 바로 연결 ───────────────────────────────────────────────────
+  async function connectSaved(name) {
+    setVaultBusy(true); setError('')
+    const r = await connectFromVault(name)
+    setVaultBusy(false)
+    if (r?.ok) setShowConnect(false)
+    else setError(r?.error || '보관본 연결 실패')
+  }
 
   // ── 컨텍스트 목록 조회 — 성공 시 {contexts, current, initialSelected} 반환, 실패 시 null ──
   const loadContexts = useCallback(async (p) => {
@@ -235,6 +255,48 @@ export default function ConnectionModal() {
               whiteSpace: 'pre-wrap', lineHeight: 1.7,
             }}>
               {error}
+            </div>
+          )}
+
+          {/* ── 하단 영역: 보관함에서 불러오기 (vault 저장본) ── */}
+          {savedList.length > 0 && (
+            <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--border)' }}>
+              <div style={{
+                fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+                letterSpacing: '0.06em', color: 'var(--text-dim)', marginBottom: 8,
+                display: 'flex', alignItems: 'center', gap: 6,
+              }}>
+                <Archive size={12} /> 보관함에서 불러오기
+                <span style={{ fontWeight: 400, textTransform: 'none',
+                  letterSpacing: 0, color: 'var(--text-mid)' }}>
+                  — 저장된 kubeconfig {savedList.length}개
+                </span>
+              </div>
+              <div style={{
+                border: '1px solid var(--border)', borderRadius: 6,
+                overflow: 'hidden', maxHeight: 180, overflowY: 'auto',
+              }}>
+                {savedList.map((nm, i) => (
+                  <div key={nm} style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '7px 12px',
+                    borderTop: i > 0 ? '1px solid var(--border)' : 'none',
+                  }}>
+                    <span style={{
+                      flex: 1, fontSize: 12.5, fontFamily: 'var(--font-mono)',
+                      color: 'var(--text)',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>{nm}</span>
+                    <button
+                      className="btn btn-default btn-sm"
+                      disabled={connecting || ctxLoading || vaultBusy}
+                      onClick={() => connectSaved(nm)}
+                    >
+                      불러오기
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

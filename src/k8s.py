@@ -13,19 +13,165 @@
 import re
 import os
 import json
+import atexit
 import tempfile
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.tools import _NO_WINDOW, _find_helm
 
+
+# ── 평문 임시 kubeconfig 크래시-세이프 정리 (v1.2.3) ───────────────────────────
+# vault content 로 연결하면 kubectl 이 파일 경로를 필요로 해 %TEMP% 에 평문
+# kubeconfig(polaris-kc-*.yaml)를 잠깐 만든다. 정상 흐름은 disconnect 시 삭제하지만,
+# 명시적 disconnect 없이 창만 닫혀 프로세스가 끝나면 평문 파일이 남을 수 있다.
+# 이 프로세스가 만든 임시 파일을 추적해 인터프리터 종료 시(atexit) 일괄 삭제한다.
+# (우리가 만든 파일만 지우므로 다중 인스턴스에도 안전.)
+_TEMP_KUBECONFIGS: set = set()
+
+
+@atexit.register
+def _purge_temp_kubeconfigs() -> None:
+    for _p in list(_TEMP_KUBECONFIGS):
+        try:
+            os.remove(_p)
+        except Exception:
+            pass
+    _TEMP_KUBECONFIGS.clear()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True                                     # 모르면 지우지 않는다
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
+def sweep_stale_temp_kubeconfigs(tmpdir: str = None, now: float = None) -> int:
+    """강제 종료 · 정전으로 atexit 가 못 돈 뒤 %TEMP% 에 남은 평문 kubeconfig 를 지운다(v1.5.28 검토).
+
+    polaris-kc-<pid>-*.yaml — 그 프로세스가 이미 없으면 지운다(다른 Polaris 가 쓰는 중인 것은 둔다).
+    예전 이름(polaris-kc-<무작위>.yaml)은 12시간 넘은 것만. 지운 개수."""
+    import glob
+    import time as _t
+    tmpdir = tmpdir or tempfile.gettempdir()
+    now = _t.time() if now is None else now
+    n = 0
+    for p in glob.glob(os.path.join(tmpdir, 'polaris-kc-*.yaml')):
+        if p in _TEMP_KUBECONFIGS:
+            continue
+        stem = os.path.basename(p)[len('polaris-kc-'):]
+        head = stem.split('-', 1)[0]
+        try:
+            if head.isdigit() and '-' in stem:
+                if _pid_alive(int(head)):
+                    continue
+            elif now - os.path.getmtime(p) < 12 * 3600:
+                continue
+            os.remove(p)
+            n += 1
+        except Exception:
+            pass
+    return n
+
 # ── kubernetes 라이브러리 ─────────────────────────────────────────────────────
-try:
-    from kubernetes import client as k8s, config as k8s_cfg
-    HAS_K8S = True
-except ImportError:
-    HAS_K8S = False
+# (v1.3.73, 성능 점검 P1) 앱 시작 2.1초 중 1.55초가 이 라이브러리를 불러오는 데 들었다
+# (`kubernetes.client` 가 모든 API 모델을 한꺼번에 읽는다). 창이 뜨는 것과는 무관하므로
+# **처음 쓸 때** 불러온다 — `k8s.X` · `k8s_cfg.X` 로 쓰는 코드는 그대로다. 있는지 여부는
+# 불러오지 않고 find_spec 으로만 본다. 시작 몇 초 뒤 백그라운드로 미리 불러 둔다(runtime).
+import importlib
+import importlib.util
+import threading as _threading
+
+HAS_K8S = importlib.util.find_spec('kubernetes') is not None
+_K8S_LOAD_LOCK = _threading.Lock()
+_K8S_READY = False
+
+
+def _after_k8s_import():
+    """라이브러리를 처음 불러온 직후 한 번 — API 호출 타임아웃·재시도 기본값(v1.3.41)."""
+    global _K8S_READY
+    with _K8S_LOAD_LOCK:
+        if _K8S_READY:
+            return
+        from src import k8s_http as _k8s_http
+        _k8s_http.install()
+        _K8S_READY = True
+
+
+class _LazyModule:
+    """첫 속성 접근 때 import 하는 모듈 대리자."""
+
+    def __init__(self, name):
+        object.__setattr__(self, '_lazy_name', name)
+        object.__setattr__(self, '_lazy_mod', None)
+
+    def _lazy_load(self):
+        mod = object.__getattribute__(self, '_lazy_mod')
+        if mod is None:
+            mod = importlib.import_module(object.__getattribute__(self, '_lazy_name'))
+            _after_k8s_import()          # 클라이언트를 만들기 **전에** 기본값을 입힌다
+            object.__setattr__(self, '_lazy_mod', mod)
+        return mod
+
+    def __getattr__(self, attr):
+        return getattr(self._lazy_load(), attr)
+
+    def __setattr__(self, attr, value):          # 테스트가 속성을 갈아 끼울 때
+        setattr(self._lazy_load(), attr, value)
+
+
+k8s = _LazyModule('kubernetes.client')
+k8s_cfg = _LazyModule('kubernetes.config')
+
+
+def _pyinstaller_hint():   # 부르지 않는다 — 이름으로 부르는 import 를 PyInstaller 가 못 따라가므로 정적 표시
+    import kubernetes.client  # noqa: F401
+    import kubernetes.config  # noqa: F401
+
+
+def preload_k8s() -> bool:
+    """백그라운드에서 미리 불러 둔다 — 첫 클러스터 연결이 1.5초 느려지지 않게."""
+    if not HAS_K8S:
+        return False
+    try:
+        k8s._lazy_load()
+        k8s_cfg._lazy_load()
+        return True
+    except Exception:
+        return False
+
+# 큰 목록은 모델 변환 없이 읽는다 (v1.3.42 — 파드 2000개 2.3초 → 수십 ms, src/k8s_fast.py).
+# 테스트가 모델 경로와 결과를 나란히 비교할 때만 끈다.
+_FAST_LISTS = True
+
+
+def _list(fn, *args, **kw):
+    """kubernetes list_* 호출 — 기본은 빠른 길(KList), _FAST_LISTS 가 꺼지면 모델."""
+    if _FAST_LISTS:
+        from src.k8s_fast import fast_list
+        return fast_list(fn, *args, **kw)
+    return fn(*args, **kw)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +187,181 @@ def _age(ts):
     if s < 3600:  return f'{s // 60}m'
     if s < 86400: return f'{s // 3600}h'
     return f'{s // 86400}d'
+
+
+# ── 파드 이상 판정 (대시보드 「주의가 필요한 파드」) ──────────────────────────
+#
+# 왜 phase 만으로 안 되는가 — **CrashLoopBackOff 파드의 phase 는 `Running` 이다.**
+# 파드는 떠 있고 컨테이너만 재시작을 반복하는 상태라서 그렇다. 그래서 phase 로만
+# 걸러내면 가장 대표적인 장애 파드가 '정상'으로 분류된다. kubectl 의 STATUS 열도
+# phase 가 아니라 컨테이너 상태에서 계산한 값이다.
+#
+# 컨테이너가 뜨는 중인 정상 과정. 이 사유는 문제로 보지 않는다.
+_BENIGN_WAITING = frozenset({'ContainerCreating', 'PodInitializing'})
+# 정상 종료. Job/CronJob 파드가 여기 걸린다.
+_BENIGN_TERMINATED = frozenset({'Completed'})
+
+
+def _pod_problem_reason(pod) -> str:
+    """파드가 문제인 사유 한 개 (없으면 빈 문자열).
+
+    허용목록(CrashLoopBackOff, ImagePullBackOff, …)을 쓰지 않는다 — 새 사유가
+    생기면 조용히 놓친다. **정상인 사유만 제외**하고 나머지는 전부 문제로 본다.
+    init 컨테이너를 먼저 본다 (init 이 막히면 앱 컨테이너는 아직 상태가 없다).
+    """
+    st = getattr(pod, 'status', None)
+    if st is None:
+        return ''
+    # pod 레벨 사유 (Evicted 등) 가 가장 구체적
+    if (st.reason or '') and st.reason != 'Completed':
+        return st.reason
+    for group in (st.init_container_statuses, st.container_statuses):
+        for cs in (group or []):
+            state = getattr(cs, 'state', None)
+            if state is None:
+                continue
+            w = getattr(state, 'waiting', None)
+            if w is not None and (w.reason or '') not in _BENIGN_WAITING:
+                return w.reason or 'Waiting'
+            t = getattr(state, 'terminated', None)
+            if t is not None and (t.reason or '') not in _BENIGN_TERMINATED:
+                return t.reason or 'Terminated'
+    return ''
+
+
+def _pod_last_restart_at(pod) -> str:
+    """마지막 재시작 시각 (ISO8601, 없으면 빈 문자열).
+
+    누적 횟수(restartCount)는 리셋되지 않아 '언제' 재시작했는지 알 수 없다.
+    lastState.terminated.finishedAt = 직전 인스턴스가 죽은 시각 = 재시작 순간.
+    그게 없으면(첫 기동 후 재시작만 있고 종료 기록이 유실된 경우) 현재 인스턴스의
+    startedAt 으로 대체한다.
+    """
+    best = None
+    st = getattr(pod, 'status', None)
+    if st is None:
+        return ''
+    for group in (st.init_container_statuses, st.container_statuses):
+        for cs in (group or []):
+            if not (cs.restart_count or 0):
+                continue
+            cand = None
+            last = getattr(cs, 'last_state', None)
+            term = getattr(last, 'terminated', None) if last is not None else None
+            if term is not None and term.finished_at:
+                cand = term.finished_at
+            else:
+                running = getattr(getattr(cs, 'state', None), 'running', None)
+                if running is not None and running.started_at:
+                    cand = running.started_at
+            if cand is not None and (best is None or cand > best):
+                best = cand
+    return best.isoformat() if best is not None else ''
+
+
+def _pod_is_abnormal(pod, ready: int, total: int) -> bool:
+    """지금 주의가 필요한 파드인가.
+
+    Succeeded(정상 완료)는 제외. 그 외에는 문제 사유가 있거나, Running 인데
+    컨테이너가 다 Ready 가 아니면 비정상으로 본다.
+    """
+    phase = (getattr(getattr(pod, 'status', None), 'phase', '') or '')
+    if phase == 'Succeeded':
+        return False
+    if _pod_problem_reason(pod):
+        return True
+    if phase != 'Running':
+        return True
+    return total > 0 and ready < total
+
+
+def _collect_fail(errors, what, e=None):
+    """수집 실패를 호출한 쪽이 넘긴 목록에 적는다 (v1.4.13, 보고서 수집 전용).
+
+    getter 들은 예외를 삼키고 [] / {} 를 돌려준다 — 화면에는 그게 맞지만 보고서는
+    「0건」 과 「수집하지 못함」 을 구분해야 한다(못 본 것을 「정상」 으로 적으면 안 된다).
+    errors 를 넘기지 않는 기존 호출은 아무것도 달라지지 않는다.
+    """
+    if errors is None:
+        return
+    errors.append(f'{what}: {type(e).__name__}: {str(e)[:160]}' if e is not None else what)
+
+
+def _controller_owner(meta):
+    """ownerReferences 중 컨트롤러 하나 → (kind, name). 없으면 ('', '')."""
+    refs = getattr(meta, 'owner_references', None) or []
+    for r in refs:
+        if getattr(r, 'controller', False):
+            return (getattr(r, 'kind', '') or '', getattr(r, 'name', '') or '')
+    if refs:
+        return (getattr(refs[0], 'kind', '') or '', getattr(refs[0], 'name', '') or '')
+    return ('', '')
+
+
+def _parse_iso(s):
+    """ISO8601 → tz-aware datetime. 실패 시 None. 'Z' 접미도 허용."""
+    if not s:
+        return None
+    try:
+        txt = str(s).strip()
+        if txt.endswith('Z'):
+            txt = txt[:-1] + '+00:00'
+        dt = datetime.fromisoformat(txt)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def select_attention_pods(pods: list, now=None, days: int = 3, limit: int = 10) -> dict:
+    """대시보드에 띄울 「주의가 필요한 파드」 선별. **순수 함수** (클러스터 불필요).
+
+    포함 규칙이 **두 개**다:
+      ① 지금 비정상  → 재시작 이력과 무관하게 **항상** 포함
+      ② 정상인데 최근 `days` 일 내 재시작 → 포함 (재발 조짐)
+
+    ①이 필요한 이유: ImagePullBackOff·Pending·CreateContainerConfigError 파드는
+    한 번도 못 떴으므로 restartCount 가 0 이고 재시작 시각도 없다. '기간 내 재시작'
+    으로만 거르면 **지금 가장 급한 파드가 목록에서 사라진다.**
+
+    반환: {items, total, truncated, abnormal_count, restart_count}
+      total 을 함께 주는 이유 — limit 으로 조용히 자르면 "10개뿐"으로 오독된다.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(0, days))
+
+    picked = []
+    abnormal_n = restart_n = 0
+    for p in (pods or []):
+        is_abn = bool(p.get('abnormal'))
+        at = _parse_iso(p.get('restarted_at'))
+        recent = at is not None and at >= cutoff
+        if not (is_abn or recent):
+            continue
+        if is_abn:
+            abnormal_n += 1
+        if recent:
+            restart_n += 1
+        picked.append({**p, 'recent_restart': recent, '_restart_dt': at})
+
+    def _key(p):
+        # 비정상 먼저 → 최근 재시작 순 → 누적 재시작 많은 순
+        ts = p['_restart_dt'].timestamp() if p['_restart_dt'] else 0
+        try:
+            restarts = int(p.get('restarts') or 0)
+        except Exception:
+            restarts = 0
+        return (0 if p.get('abnormal') else 1, -ts, -restarts)
+
+    picked.sort(key=_key)
+    items = [{k: v for k, v in p.items() if k != '_restart_dt'} for p in picked[:limit]]
+    return {
+        'items':          items,
+        'total':          len(picked),
+        'truncated':      len(picked) > len(items),
+        'abnormal_count': abnormal_n,
+        'restart_count':  restart_n,
+        'window_days':    days,
+    }
 
 
 def _jsonpath_get(obj, path):
@@ -266,13 +587,79 @@ _RFC1123_DNS_SUBDOMAIN = re.compile(
 )
 
 
+# ── kubectl 인자 검사 (v1.5.28 검토) ─────────────────────────────────────────
+# kind · 이름 · 네임스페이스 · 컨테이너는 kubectl argv 에 그대로 들어간다. 「--all」 · 「--kubeconfig=\\host\x」 ·
+# 「--server=…」 · 「secret,configmap」 같은 값이 오면 다른 뜻이 된다(전부 지우기 · 다른 kubeconfig 의 exec 실행 ·
+# 토큰을 다른 서버로 · Secret 가리기 우회). 화면 · MCP 에서 오는 값을 kubectl 에 넘기기 전에 여기서 거른다.
+# 이름은 RFC1123 보다 넓다 — ClusterRole 「system:aggregate-to-admin」 처럼 ':' 가 들어간 이름이 실제로 있다.
+_KIND_RE = re.compile(r'^[A-Za-z][A-Za-z0-9.\-]{0,252}$')
+_OBJ_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:@\-]{0,252}$')
+
+
+def _kubectl_target_error(kind: str = None, ns: str = None, name: str = None, container: str = None) -> str:
+    """빈 문자열 = 통과. None 인 인자는 검사하지 않는다(빈 문자열 ns 는 「네임스페이스 없음」 으로 허용)."""
+    if kind is not None and not _KIND_RE.match(str(kind)):
+        return f'리소스 종류가 올바르지 않습니다: {str(kind)[:60]!r}'
+    if ns not in (None, '') and not _RFC1123_DNS_LABEL.match(str(ns)):
+        return f'네임스페이스 이름이 올바르지 않습니다: {str(ns)[:60]!r}'
+    if name is not None and not _OBJ_NAME_RE.match(str(name)):
+        return f'리소스 이름이 올바르지 않습니다: {str(name)[:60]!r}'
+    if container not in (None, '') and not _RFC1123_DNS_LABEL.match(str(container)):
+        return f'컨테이너 이름이 올바르지 않습니다: {str(container)[:60]!r}'
+    return ''
+
+
+_KC_PATH_FIELDS = {'clusters': ('cluster', ('certificate-authority',)),
+                   'users': ('user', ('client-certificate', 'client-key', 'tokenFile'))}
+
+
+def _kubeconfig_with_context(text, context: str, base_dir: str = ''):
+    """current-context 를 context 로 바꾼 kubeconfig 글. 이미 그렇거나 그런 context 가 없거나 못 읽으면 None.
+
+    base_dir — 원래 파일이 있던 폴더. 사본은 임시 폴더에 놓이므로 상대 경로(인증서 · 키 파일)를 절대 경로로 바꾼다.
+    """
+    if not text or not context:
+        return None
+    import yaml
+    try:
+        kc = yaml.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(kc, dict) or kc.get('current-context') == context:
+        return None
+    if not any(isinstance(c, dict) and c.get('name') == context for c in kc.get('contexts') or []):
+        return None
+    kc['current-context'] = context
+    if base_dir:
+        for section, (inner, fields) in _KC_PATH_FIELDS.items():
+            for item in kc.get(section) or []:
+                body = item.get(inner) if isinstance(item, dict) else None
+                if not isinstance(body, dict):
+                    continue
+                for fld in fields:
+                    v = body.get(fld)
+                    if isinstance(v, str) and v and not os.path.isabs(os.path.expanduser(v)):
+                        body[fld] = os.path.normpath(os.path.join(base_dir, v))
+    return yaml.safe_dump(kc, sort_keys=False, allow_unicode=True)
+
+
 def _is_secret_kind(kind: str) -> bool:
     """Kubernetes Secret 리소스 여부 (UI alias 도 포함)."""
     return (kind or '').lower().rstrip('s') == 'secret'
 
 
+# kubectl apply 로 만든 리소스는 metadata.annotations 에 원본 오브젝트 전체(JSON, Secret data
+# 포함)를 이 키로 그대로 보관한다 — data:/stringData: 블록 밖이라 아래 스캐너가 원래 못 잡았다
+# (Secret 마스킹 우회 경로). 값은 한 줄/블록 스칼라(|)/줄바꿈 래핑 어느 형태든 key 보다 더 들여쓰인
+# continuation 줄로 이어지므로, 아래에서 data:/stringData: 와 동일한 들여쓰기 추적으로 함께 마스킹.
+_LAST_APPLIED_ANNOTATION_RE = re.compile(
+    r'^(\s*)"?kubectl\.kubernetes\.io/last-applied-configuration"?\s*:'
+)
+
+
 def _redact_secret_yaml(yaml_text: str) -> str:
-    """Secret YAML 의 data: / stringData: 블록 값을 '[REDACTED]' 로 치환.
+    """Secret YAML 의 data: / stringData: 블록 값 + last-applied-configuration 주석(원본 통째
+    보관 — 우회 경로)을 '[REDACTED]' 로 치환.
 
     base64 인코딩된 token / TLS key / 패스워드가 UI 에 평문 노출되지 않게 한다.
     파싱 실패 시 입력 그대로 반환 (안전한 폴백).
@@ -284,10 +671,27 @@ def _redact_secret_yaml(yaml_text: str) -> str:
         out = []
         in_block = False
         block_indent = -1
+        in_annotation = False
+        annotation_indent = -1
         for line in lines:
             stripped_r = line.rstrip()
             leading = len(stripped_r) - len(stripped_r.lstrip(' '))
             bare = stripped_r.strip()
+
+            # last-applied-configuration 값 continuation(블록 스칼라/줄바꿈) 스킵 중.
+            # 빈 줄은 블록 내부일 수 있어 그냥 버림(원본 보존 불필요), 더 들여쓰였으면 계속 값 내부.
+            if in_annotation:
+                if not bare or leading > annotation_indent:
+                    continue
+                in_annotation = False   # 값 종료 — 이 줄부터 정상 처리로 재진입
+
+            m = _LAST_APPLIED_ANNOTATION_RE.match(stripped_r)
+            if m and not in_block:
+                out.append(f'{m.group(1)}kubectl.kubernetes.io/last-applied-configuration: "[REDACTED]"')
+                in_annotation = True
+                annotation_indent = len(m.group(1))
+                continue
+
             # 'data:' / 'stringData:' 블록 시작 (key 만 있고 값 비어있는 형태)
             if (bare == 'data:' or bare == 'stringData:' or
                 bare == 'data: {}' or bare == 'stringData: {}'):
@@ -321,14 +725,99 @@ _DESCRIBE_SENSITIVE = re.compile(
 )
 
 
-def _redact_secret_describe(text: str) -> str:
-    """kubectl describe secret 출력에서 token/password/cert/key 가 들어간 라인의
-    값을 마스킹. describe 의 'Data' 섹션은 길이만 노출하지만,
-    Annotations/Events 등에 평문이 새는 케이스 보강."""
+# CRD 커스텀 객체(plural.group 형식 kind)는 _is_secret_kind 가 절대 True 가 안 돼 위 두 함수의
+# 대상이 아니었다 — DB 오퍼레이터 등 일부 CRD 는 자격증명을 spec 에 인라인으로 담는다(예:
+# password/apiKey 필드). suffix 매칭이라 'secretName'/'secretRef'/'tokenLifetime' 처럼 값 자체는
+# 민감하지 않은 참조·메타 필드(흔히 built-in 리소스 describe 에도 나옴)는 피하고, 'password'/
+# 'dbPassword'/'apiKey'/'rootToken' 처럼 값 자체가 자격증명인 필드만 잡는다. 'cert'는 의도적으로
+# 제외 — 서버 인증서(공개)는 그 자체가 비밀이 아니라 개인키(privatekey)만 문제.
+_SENSITIVE_KEY_SUFFIXES = (
+    'password', 'passwd', 'pwd', 'passphrase',
+    'apikey', 'accesskey', 'secretkey', 'privatekey',
+    'token', 'credential', 'credentials', 'secret',
+)
+
+
+def _looks_sensitive_key(key: str) -> bool:
+    norm = re.sub(r'[_\-\s]', '', key).lower()
+    return any(norm.endswith(suf) for suf in _SENSITIVE_KEY_SUFFIXES)
+
+
+def _redact_sensitive_yaml_fields(yaml_text: str) -> str:
+    """YAML 의 'key: value' 스칼라 라인 중 key 이름이 민감해 보이면 값을 마스킹.
+
+    kind 와 무관하게(주로 CRD 커스텀 객체) baseline 으로 적용. data:/stringData: 같은 중첩
+    블록은 대상 아님(Secret 전용 _redact_secret_yaml 이 이미 처리) — 여기는 flat scalar 라인만
+    다뤄 'secretName: foo' 같은 참조 필드는 안전하게 통과시킨다. 파싱 실패 시 원본 반환.
+    """
+    if not yaml_text:
+        return yaml_text
+    try:
+        out = []
+        for line in yaml_text.split('\n'):
+            m = re.match(r'^([\w.\-]+):\s*(.+)$', line.strip())
+            if m and _looks_sensitive_key(m.group(1)):
+                val = m.group(2).strip()
+                if val and val[0] not in '|>{[' and val not in ('null', '~'):
+                    leading = len(line) - len(line.lstrip(' '))
+                    out.append(' ' * leading + f'{m.group(1)}: "[REDACTED]"')
+                    continue
+            out.append(line)
+        return '\n'.join(out)
+    except Exception:
+        return yaml_text
+
+
+def _redact_sensitive_describe_fields(text: str) -> str:
+    """kubectl describe 출력의 'Key:   value' 라인(tabwriter 정렬) 중 key 이름이 민감해 보이면
+    값을 마스킹. _redact_sensitive_yaml_fields 와 동일 suffix 휴리스틱."""
     if not text:
         return text
     try:
-        return _DESCRIBE_SENSITIVE.sub(r'\1 [REDACTED]', text)
+        out = []
+        for line in text.split('\n'):
+            m = re.match(r'^(\s*)([\w][\w \-./]*?):(\s+)(\S.*)$', line)
+            if m and _looks_sensitive_key(m.group(2)):
+                out.append(f'{m.group(1)}{m.group(2)}:{m.group(3)}[REDACTED]')
+                continue
+            out.append(line)
+        return '\n'.join(out)
+    except Exception:
+        return text
+
+
+def _redact_secret_describe(text: str) -> str:
+    """kubectl describe secret 출력에서 token/password/cert/key 가 들어간 라인의
+    값을 마스킹. describe 의 'Data' 섹션은 길이만 노출하지만,
+    Annotations/Events 등에 평문이 새는 케이스 보강.
+
+    last-applied-configuration 주석은 키 자체에 token/password 등 키워드가 없어 위 정규식이
+    못 잡는다 — describe 가 원본 Secret data 를 통째로(여러 줄에 걸쳐) 출력할 수 있어 별도 처리."""
+    if not text:
+        return text
+    try:
+        text = _DESCRIBE_SENSITIVE.sub(r'\1 [REDACTED]', text)
+        lines = text.split('\n')
+        out = []
+        skipping = False
+        skip_indent = -1
+        needle = 'kubectl.kubernetes.io/last-applied-configuration'
+        for line in lines:
+            stripped_r = line.rstrip()
+            leading = len(stripped_r) - len(stripped_r.lstrip(' '))
+            bare = stripped_r.strip()
+            if skipping:
+                if not bare or leading > skip_indent:
+                    continue
+                skipping = False
+            idx = line.find(needle)
+            if idx >= 0:
+                out.append(f'{line[:idx]}{needle}: [REDACTED]')
+                skipping = True
+                skip_indent = idx
+                continue
+            out.append(line)
+        return '\n'.join(out)
     except Exception:
         return text
 
@@ -658,6 +1147,55 @@ def _build_rollout_restart_args(kind: str, ns: str, name: str) -> list[str]:
     return (['-n', ns] if ns else []) + ['rollout', 'restart', f'{k}/{name}']
 
 
+def _build_rollout_undo_args(kind: str, ns: str, name: str, revision) -> list[str]:
+    """kubectl rollout undo --to-revision args 빌더. 검증 실패 시 ValueError.
+
+    지정 리비전으로 롤백한다. (지원: deployment/statefulset/daemonset)"""
+    k = _normalize_kubectl_kind(kind)
+    if k not in _RESTARTABLE_KINDS:
+        raise ValueError(f'rollback 불가 리소스: {kind} (지원: deployment/statefulset/daemonset)')
+    name = str(name or '').strip()
+    if not name:
+        raise ValueError('리소스 이름이 필요합니다.')
+    if len(name) > 253 or not _RFC1123_DNS_SUBDOMAIN.match(name):
+        raise ValueError(f'잘못된 리소스 이름: {name!r}')
+    try:
+        rev = int(revision)
+    except Exception as exc:
+        raise ValueError('revision 은 정수여야 합니다.') from exc
+    if rev <= 0:
+        raise ValueError('revision 은 1 이상이어야 합니다.')
+    ns = str(ns or '').strip()
+    if ns and (len(ns) > 63 or not _RFC1123_DNS_LABEL.match(ns)):
+        raise ValueError(f'잘못된 네임스페이스: {ns!r}')
+    return (['-n', ns] if ns else []) + ['rollout', 'undo', f'{k}/{name}', f'--to-revision={rev}']
+
+
+def _images_from_cr_data(data) -> list[str]:
+    """ControllerRevision.data(직렬화된 템플릿 패치)에서 컨테이너 이미지 목록 추출.
+
+    StatefulSet/DaemonSet 의 리비전은 ControllerRevision 에 보관되며, 그 시점 템플릿이
+    data.spec.template.spec.containers 경로에 들어 있다 (Deployment 의 ReplicaSet
+    spec.template 에 대응). dict / JSON 문자열 / bytes 를 모두 수용하고, 구조가
+    예상과 다르거나 파싱에 실패하면 빈 리스트를 반환한다(나머지 리비전 정보는 유지).
+    """
+    import json as _json
+    try:
+        if data is None:
+            return []
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode('utf-8', 'replace')
+        if isinstance(data, str):
+            data = _json.loads(data)
+        if not isinstance(data, dict):
+            return []
+        spec = (((data.get('spec') or {}).get('template') or {}).get('spec') or {})
+        return [c['image'] for c in (spec.get('containers') or [])
+                if isinstance(c, dict) and c.get('image')]
+    except Exception:
+        return []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # K8sManager — kubernetes Python 클라이언트 래퍼
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,7 +1216,7 @@ class K8sManager:
     # 임시 파일을 만들고 disconnect 시 삭제한다.
     def _write_temp_kubeconfig(self, content: str) -> str:
         self._cleanup_temp_kubeconfig()
-        fd, tmp = tempfile.mkstemp(suffix='.yaml', prefix='polaris-kc-')
+        fd, tmp = tempfile.mkstemp(suffix='.yaml', prefix=f'polaris-kc-{os.getpid()}-')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -689,10 +1227,11 @@ class K8sManager:
                 pass
             raise
         try:
-            os.chmod(tmp, 0o600)   # 소유자만 읽기 (best-effort)
+            os.chmod(tmp, 0o600)   # 소유자만 읽기 (best-effort; Windows 는 %TEMP% 가 사용자 전용)
         except Exception:
             pass
         self._temp_kubeconfig = tmp
+        _TEMP_KUBECONFIGS.add(tmp)   # atexit 크래시-세이프 정리 대상 등록 (v1.2.3)
         return tmp
 
     def _cleanup_temp_kubeconfig(self):
@@ -702,6 +1241,7 @@ class K8sManager:
                 os.remove(tmp)
             except Exception:
                 pass
+            _TEMP_KUBECONFIGS.discard(tmp)
             self._temp_kubeconfig = None
 
     # ── 연결 ─────────────────────────────────────────────────────────────────
@@ -709,6 +1249,21 @@ class K8sManager:
     def connect(self, path: str = None, context: str = None, content: str = None):
         if not HAS_K8S:
             return False, 'pip install kubernetes 후 재시작하세요.'
+
+        # ── 고른 context 를 kubectl · helm · exec 에도 (v1.5.28 검토) ───────────
+        # 파이썬 클라이언트만 context 를 받고, kubectl · helm · 파드 셸 · 로그 · 포트포워딩은 `--kubeconfig 파일` 만 받아
+        # 그 파일의 current-context 로 갔다 — prod 를 골라 놓고 삭제 · 적용 · helm 업그레이드가 dev 에 들어갈 수 있었다.
+        # 고른 context 가 current-context 와 다르면 그것을 current-context 로 둔 사본으로 연결한다.
+        if context:
+            try:
+                src_text = content if content is not None else (
+                    Path(path).read_text(encoding='utf-8') if path and Path(path).is_file()
+                    and Path(path).stat().st_size <= 5 * 1024 * 1024 else None)
+                fixed = _kubeconfig_with_context(src_text, context, str(Path(path).parent) if path and content is None else '')
+                if fixed is not None:
+                    content = fixed
+            except Exception:
+                pass                      # 못 읽으면 아래 기존 경로가 알맞은 오류를 낸다
 
         # ── content 기반 연결 (vault 복원) — 세션 임시 파일 생성 ────────────────
         used_temp = False
@@ -750,7 +1305,8 @@ class K8sManager:
             self.storage     = k8s.StorageV1Api(api_client=api_client)
             self.rbac        = k8s.RbacAuthorizationV1Api(api_client=api_client)
             self.policy      = k8s.PolicyV1Api(api_client=api_client)
-            ver = k8s.VersionApi(api_client=api_client).get_code()
+            # 연결 확인은 짧게 — 여기서 기다리는 동안 세션 복원이 통째로 멈춘다
+            ver = k8s.VersionApi(api_client=api_client).get_code(_request_timeout=(5, 20))
             # 컨텍스트 이름 결정: 지정된 context 우선, 없으면 current-context
             if context:
                 ctx_name = context
@@ -764,6 +1320,11 @@ class K8sManager:
             self.kubeconfig   = path
             self.connected    = True
             self.cluster_info = {'version': ver.git_version, 'context': ctx_name}
+            try:   # kubectl 을 이 클러스터 판에 가장 가까운 것으로 고르게(v1.5.74)
+                from src.tools import note_server_version
+                note_server_version(path, ver.git_version)
+            except Exception:
+                pass
             return True, f'연결 성공 — {ver.git_version}'
         except Exception as e:
             self.connected = False
@@ -840,23 +1401,35 @@ class K8sManager:
 
     # ── 파드 ──────────────────────────────────────────────────────────────────
 
-    def get_pods(self, ns=None) -> list:
+    def get_pods(self, ns=None, detail=False, *, owner=False, errors=None) -> list:
+        """파드 목록.
+
+        detail=True 면 `reason`(비정상 사유) · `restarted_at`(마지막 재시작 시각) ·
+        `abnormal` 을 추가한다. **기본값은 False 로 기존 반환 형태를 그대로 유지** —
+        이 함수는 리소스 브라우저·스냅샷·보고서 등 8곳이 공유하므로 필드를 무조건
+        늘리면 엉뚱한 화면에 열이 새어나온다. 대시보드만 detail 을 켠다.
+
+        owner=True 면 `owner_kind` · `owner_name`(컨트롤러 ownerReference)을 더한다 —
+        보고서가 「이미 성공한 Job 의 실패한 이전 시도」 를 가려내는 데 쓴다(v1.4.13).
+        errors 에 목록을 넘기면 조회 실패를 거기에 적는다(반환값은 그대로 []).
+        """
         try:
-            items = (self.core.list_namespaced_pod(ns).items
+            items = (_list(self.core.list_namespaced_pod, ns).items
                      if not self._an(ns)
-                     else self.core.list_pod_for_all_namespaces().items)
-        except Exception:
+                     else _list(self.core.list_pod_for_all_namespaces).items)
+        except Exception as e:
+            _collect_fail(errors, 'pods', e)
             return []
         rows = []
         for p in items:
-            total = len(p.spec.containers)
+            total = len(p.spec.containers or [])
             ready = restarts = 0
             if p.status.container_statuses:
                 for cs in p.status.container_statuses:
                     if cs.ready:
                         ready += 1
                     restarts += cs.restart_count or 0
-            rows.append({
+            row = {
                 'name':      p.metadata.name,
                 'namespace': p.metadata.namespace,
                 'ready':     f'{ready}/{total}',
@@ -865,7 +1438,14 @@ class K8sManager:
                 'node':      p.spec.node_name or 'N/A',
                 'age':       _age(p.metadata.creation_timestamp),
                 '_ns': p.metadata.namespace, '_kind': 'pod',
-            })
+            }
+            if detail:
+                row['reason'] = _pod_problem_reason(p)
+                row['restarted_at'] = _pod_last_restart_at(p)
+                row['abnormal'] = _pod_is_abnormal(p, ready, total)
+            if owner:
+                row['owner_kind'], row['owner_name'] = _controller_owner(p.metadata)
+            rows.append(row)
         return rows
 
     # ── 디플로이먼트 ──────────────────────────────────────────────────────────
@@ -942,12 +1522,13 @@ class K8sManager:
 
     # ── 잡 ───────────────────────────────────────────────────────────────────
 
-    def get_jobs(self, ns=None) -> list:
+    def get_jobs(self, ns=None, *, errors=None) -> list:
         try:
             items = (self.batch.list_namespaced_job(ns).items
                      if not self._an(ns)
                      else self.batch.list_job_for_all_namespaces().items)
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'jobs', e)
             return []
         rows = []
         for j in items:
@@ -993,12 +1574,13 @@ class K8sManager:
 
     # ── 서비스 ───────────────────────────────────────────────────────────────
 
-    def get_services(self, ns=None) -> list:
+    def get_services(self, ns=None, *, errors=None) -> list:
         try:
             items = (self.core.list_namespaced_service(ns).items
                      if not self._an(ns)
                      else self.core.list_service_for_all_namespaces().items)
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'services', e)
             return []
         rows = []
         for s in items:
@@ -1022,12 +1604,17 @@ class K8sManager:
 
     # ── 인그레스 ─────────────────────────────────────────────────────────────
 
-    def get_ingresses(self, ns=None) -> list:
+    def get_ingresses(self, ns=None, *, tls=False, errors=None) -> list:
+        """Ingress 목록. tls=True 면 `tls`(spec.tls 항목별 Secret 이름 · 없으면 호스트) 목록을
+        더한다 — 빈 목록이면 TLS 설정이 없다는 뜻이다(v1.4.13, 보고서 전용).
+        기본값은 기존 반환 형태 그대로 — 스냅샷 diff 대상이라 필드를 늘리면 첫 비교에서
+        모든 Ingress 가 「변경」 으로 나온다."""
         try:
             items = (self.net.list_namespaced_ingress(ns).items
                      if not self._an(ns)
                      else self.net.list_ingress_for_all_namespaces().items)
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'ingresses', e)
             return []
         rows = []
         for i in items:
@@ -1044,6 +1631,11 @@ class K8sManager:
                 'age':       _age(i.metadata.creation_timestamp),
                 '_ns': i.metadata.namespace, '_kind': 'ingress',
             })
+            if tls:
+                rows[-1]['tls'] = [
+                    (getattr(t, 'secret_name', None)
+                     or ','.join(getattr(t, 'hosts', None) or []) or '(기본 인증서)')
+                    for t in (getattr(i.spec, 'tls', None) or [])]
         return rows
 
     # ── 컨피그맵 ─────────────────────────────────────────────────────────────
@@ -1083,12 +1675,13 @@ class K8sManager:
 
     # ── PVC ──────────────────────────────────────────────────────────────────
 
-    def get_pvcs(self, ns=None) -> list:
+    def get_pvcs(self, ns=None, *, errors=None) -> list:
         try:
             items = (self.core.list_namespaced_persistent_volume_claim(ns).items
                      if not self._an(ns)
                      else self.core.list_persistent_volume_claim_for_all_namespaces().items)
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'pvcs', e)
             return []
         return [{
             'name':         p.metadata.name,
@@ -1265,20 +1858,24 @@ class K8sManager:
         result = {
             'pods': [], 'nodes': [], 'node_metrics': [],
             'total_restarts': 0, 'namespace_count': 0,
+            'attention': {'items': [], 'total': 0, 'truncated': False,
+                          'abnormal_count': 0, 'restart_count': 0, 'window_days': 3},
         }
         if not self.core:
             return result
         try:
-            pods = self.get_pods(None)
+            # detail=True — 사유/재시작 시각이 필요하다. 추가 API 호출은 없다(같은 응답에서 추출).
+            pods = self.get_pods(None, detail=True)
             result['pods'] = pods
             result['total_restarts'] = sum(int(p.get('restarts', 0)) for p in pods)
+            result['attention'] = select_attention_pods(pods)
 
             node_pod_cnt = {}
             for p in pods:
                 nd = p.get('node', '')
                 node_pod_cnt[nd] = node_pod_cnt.get(nd, 0) + 1
 
-            for n in self.core.list_node().items:
+            for n in _list(self.core.list_node).items:
                 labels = n.metadata.labels or {}
                 roles = [lbl.split('/')[-1] for lbl in labels
                          if 'node-role.kubernetes.io/' in lbl] or ['<none>']
@@ -1303,7 +1900,7 @@ class K8sManager:
                 _apply_node_metric(n, metrics.get(n['name']))
                 for n in result['nodes']
             ]
-            result['namespace_count'] = len(self.core.list_namespace().items)
+            result['namespace_count'] = len(_list(self.core.list_namespace).items)
         except Exception:
             pass
         return result
@@ -1472,8 +2069,11 @@ class K8sManager:
 
     # ── Helm ─────────────────────────────────────────────────────────────────
 
-    def get_helm_releases(self) -> list:
-        """Helm 릴리스 목록 — helm CLI 우선, K8s Secret 폴백."""
+    def get_helm_releases(self, *, errors=None) -> list:
+        """Helm 릴리스 목록 — helm CLI 우선, K8s Secret 폴백.
+
+        errors 는 폴백(Secret 조회)까지 실패했을 때만 적는다 — helm CLI 가 없어도
+        Secret 으로 읽혔으면 수집된 것이다."""
         helm = _find_helm()
         if helm and self.kubeconfig:
             try:
@@ -1495,15 +2095,24 @@ class K8sManager:
                     } for d in data]
             except Exception:
                 pass
-        return self._helm_releases_from_secrets()
+        return self._helm_releases_from_secrets(errors=errors)
 
-    def _helm_releases_from_secrets(self) -> list:
-        """K8s Secret (type=helm.sh/release.v1) 에서 릴리즈 메타 추출."""
+    def _helm_releases_from_secrets(self, *, errors=None) -> list:
+        """K8s Secret (type=helm.sh/release.v1) 에서 릴리즈 메타 추출.
+
+        label_selector/field_selector 로 서버측 선필터 — helm 릴리스가 아닌 나머지 Secret
+        (TLS·토큰·레지스트리 등, 대개 훨씬 많고 helm 릴리스는 차트 전체를 gzip+base64 로 품어
+        개당 최대 1MB 급)을 전송받지 않는다. 클라이언트측 재확인은 방어적으로 유지."""
         if not self.core:
+            _collect_fail(errors, 'helm: core API 미연결')
             return []
         try:
             seen: dict = {}
-            for s in self.core.list_secret_for_all_namespaces().items:
+            secrets = self.core.list_secret_for_all_namespaces(
+                label_selector='owner=helm',
+                field_selector='type=helm.sh/release.v1',
+            ).items
+            for s in secrets:
                 if s.type != 'helm.sh/release.v1':
                     continue
                 lbl = s.metadata.labels or {}
@@ -1525,9 +2134,25 @@ class K8sManager:
                         '_rev':        rev,
                     }
             return [v for v in seen.values()]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'helm', e)
             return []
 
+
+    def helm_release_secrets_meta(self, extra_selector: str = '') -> list:
+        """helm 릴리스 Secret 들의 **metadata 만** (v1.3.42, 성능 P3).
+
+        extra_selector 는 호출하는 쪽이 고정 문자열로 줄 때만 쓴다(사용자 입력 금지).
+        metadata 전용 요청이 실패하면(오래된 서버·프록시) 예전처럼 전체를 받는다.
+        """
+        sel = 'owner=helm' + (f',{extra_selector}' if extra_selector else '')
+        try:
+            from src.k8s_fast import list_metadata
+            return list_metadata(self._api_client, '/api/v1/secrets', label_selector=sel,
+                                 field_selector='type=helm.sh/release.v1').items
+        except Exception:
+            return self.core.list_secret_for_all_namespaces(
+                label_selector=sel, field_selector='type=helm.sh/release.v1').items
 
     def get_helm_releases_by_label(self, label_key: str, label_value: str = None,
                                     extra_meta_key: str = '') -> dict:
@@ -1537,7 +2162,7 @@ class K8sManager:
         범용 헬퍼. K8sManager 자체는 도메인 특화 라벨(=특정 기능명)을 알지 못한다.
 
         Args:
-            label_key:      필터링할 레이블 키 (예: 'polaris-catalog')
+            label_key:      필터링할 레이블 키 (예: 'app.kubernetes.io/part-of')
             label_value:    필터링할 값. None 이면 키 존재만 체크.
             extra_meta_key: 결과 dict 값으로 가져올 추가 레이블 키.
 
@@ -1549,9 +2174,12 @@ class K8sManager:
         if not self.core:
             return result
         try:
-            for s in self.core.list_secret_for_all_namespaces().items:
-                if s.type != 'helm.sh/release.v1':
-                    continue
+            # 서버측 선필터(helm 릴리스 Secret 만) — label_key/label_value 자체는 호출부마다 다른
+            # 임의 값이라 selector 문자열에 안전하게 넣을 보장이 없어 계속 파이썬에서 필터한다.
+            # (v1.3.42) 라벨만 보면 되므로 **metadata 만** 받는다 — 릴리스 Secret 은 차트
+            # 전체를 품어 하나에 최대 1MB, 리비전마다 하나씩이다. type 은 서버가 이미 걸렀다.
+            secrets = self.helm_release_secrets_meta()
+            for s in secrets:
                 lbl = s.metadata.labels or {}
                 if lbl.get('owner') != 'helm':
                     continue
@@ -1575,7 +2203,7 @@ class K8sManager:
 
     # ── 보고서용 확장 getter ─────────────────────────────────────────────────
 
-    def get_node_extended(self):
+    def get_node_extended(self, *, errors=None):
         try:
             out = []
             for n in self.core.list_node().items:
@@ -1609,16 +2237,18 @@ class K8sManager:
                     'container_runtime': ni.container_runtime_version if ni else 'N/A',
                 })
             return out
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'nodes', e)
             return []
 
-    def get_namespaces_extended(self):
+    def get_namespaces_extended(self, *, errors=None):
         try:
             return [{'name':   n.metadata.name,
                      'status': n.status.phase if n.status else 'Unknown',
                      'age':    _age(n.metadata.creation_timestamp)}
                     for n in self.core.list_namespace().items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'namespaces', e)
             return []
 
     def get_pod_metrics_all(self):
@@ -1703,20 +2333,34 @@ class K8sManager:
                         'no_metrics_server': True}
             return {'ok': False, 'error': err_str}
 
-    def get_deployments_extended(self):
+    def get_deployments_extended(self, *, meta=False, errors=None):
+        """meta=True 면 replicas 를 누가 관리하는지 판단할 근거를 더한다(v1.4.13, 보고서 전용):
+        `owners`(ownerReferences kind 목록) · `managed_by`(app.kubernetes.io/managed-by) ·
+        `argocd`(Argo CD 추적 표시 여부). 기본값은 기존 반환 형태 그대로 — 스냅샷 diff 대상이다."""
         try:
             items = self.apps.list_deployment_for_all_namespaces().items
-            return [{'namespace': d.metadata.namespace, 'name': d.metadata.name,
+            rows = [{'namespace': d.metadata.namespace, 'name': d.metadata.name,
                      'ready':    d.status.ready_replicas or 0,
                      'desired':  d.spec.replicas or 0,
                      'available': d.status.available_replicas or 0,
                      'strategy': d.spec.strategy.type if d.spec and d.spec.strategy else '-',
                      'age':      _age(d.metadata.creation_timestamp)}
                     for d in items]
-        except Exception:
+            if meta:
+                for row, d in zip(rows, items):
+                    labels = d.metadata.labels or {}
+                    ann = d.metadata.annotations or {}
+                    row['owners'] = [getattr(r, 'kind', '') or ''
+                                     for r in (d.metadata.owner_references or [])]
+                    row['managed_by'] = str(labels.get('app.kubernetes.io/managed-by', '') or '')
+                    row['argocd'] = bool(ann.get('argocd.argoproj.io/tracking-id')
+                                         or labels.get('argocd.argoproj.io/instance'))
+            return rows
+        except Exception as e:
+            _collect_fail(errors, 'deployments', e)
             return []
 
-    def get_statefulsets_extended(self):
+    def get_statefulsets_extended(self, *, errors=None):
         try:
             items = self.apps.list_stateful_set_for_all_namespaces().items
             return [{'namespace': s.metadata.namespace, 'name': s.metadata.name,
@@ -1725,7 +2369,8 @@ class K8sManager:
                      'service': s.spec.service_name or '-',
                      'age':     _age(s.metadata.creation_timestamp)}
                     for s in items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'statefulsets', e)
             return []
 
     def get_daemonsets_extended(self):
@@ -1740,16 +2385,17 @@ class K8sManager:
         except Exception:
             return []
 
-    def get_resource_quotas(self):
+    def get_resource_quotas(self, *, errors=None):
         try:
             return [{'namespace': rq.metadata.namespace, 'name': rq.metadata.name,
                      'hard': {k: str(v) for k, v in (rq.status.hard or {}).items()},
                      'used': {k: str(v) for k, v in (rq.status.used or {}).items()}}
                     for rq in self.core.list_resource_quota_for_all_namespaces().items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'resource_quotas', e)
             return []
 
-    def get_limit_ranges(self):
+    def get_limit_ranges(self, *, errors=None):
         try:
             out = []
             for lr in self.core.list_limit_range_for_all_namespaces().items:
@@ -1763,11 +2409,13 @@ class K8sManager:
                 out.append({'namespace': lr.metadata.namespace,
                             'name': lr.metadata.name, 'limits': limits})
             return out
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'limit_ranges', e)
             return []
 
-    def get_hpa_extended(self):
+    def get_hpa_extended(self, *, errors=None):
         if not self.autoscaling:
+            _collect_fail(errors, 'hpa: autoscaling API 미연결')
             return []
         try:
             return [{'namespace':   h.metadata.namespace, 'name': h.metadata.name,
@@ -1780,26 +2428,39 @@ class K8sManager:
                      'current_cpu': h.status.current_cpu_utilization_percentage or '-',
                      'age':         _age(h.metadata.creation_timestamp)}
                     for h in self.autoscaling.list_horizontal_pod_autoscaler_for_all_namespaces().items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'hpa', e)
             return []
 
-    def get_pdbs(self):
+    def get_pdbs(self, *, meta=False, errors=None):
+        """meta=True 면 `labels` · `owners`(ownerReferences kind 목록)를 더한다 — 보고서가
+        오퍼레이터(Longhorn · Rook 등)가 만든 PDB 를 가려내는 데 쓴다(v1.4.13)."""
         if not self.policy:
+            _collect_fail(errors, 'pdbs: policy API 미연결')
             return []
         try:
-            return [{'namespace':           p.metadata.namespace, 'name': p.metadata.name,
+            items = self.policy.list_pod_disruption_budget_for_all_namespaces().items
+            rows = [{'namespace':           p.metadata.namespace, 'name': p.metadata.name,
                      'min_available':       getattr(p.spec, 'min_available', '-'),
                      'max_unavailable':     getattr(p.spec, 'max_unavailable', '-'),
                      'current_healthy':     getattr(p.status, 'current_healthy', 0),
                      'desired_healthy':     getattr(p.status, 'desired_healthy', 0),
                      'disruptions_allowed': getattr(p.status, 'disruptions_allowed', 0),
                      'age':                 _age(p.metadata.creation_timestamp)}
-                    for p in self.policy.list_pod_disruption_budget_for_all_namespaces().items]
-        except Exception:
+                    for p in items]
+            if meta:
+                for row, p in zip(rows, items):
+                    row['labels'] = dict(p.metadata.labels or {})
+                    row['owners'] = [getattr(r, 'kind', '') or ''
+                                     for r in (p.metadata.owner_references or [])]
+            return rows
+        except Exception as e:
+            _collect_fail(errors, 'pdbs', e)
             return []
 
-    def get_network_policies(self):
+    def get_network_policies(self, *, errors=None):
         if not self.net:
+            _collect_fail(errors, 'network_policies: networking API 미연결')
             return []
         try:
             return [{'namespace':     n.metadata.namespace, 'name': n.metadata.name,
@@ -1808,8 +2469,47 @@ class K8sManager:
                      'egress_rules':  len(n.spec.egress  or []) if n.spec else 0,
                      'age':           _age(n.metadata.creation_timestamp)}
                     for n in self.net.list_network_policy_for_all_namespaces().items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'network_policies', e)
             return []
+
+    # CNI 전용 정책 — Kubernetes NetworkPolicy 만 세면 Cilium · Calico 로 막아 둔 클러스터를
+    # 「트래픽 제한 없음」 으로 잘못 적는다(v1.4.13).
+    _CNI_POLICY_KINDS = (
+        ('CiliumNetworkPolicy',            'cilium.io',             'v2', 'ciliumnetworkpolicies'),
+        ('CiliumClusterwideNetworkPolicy', 'cilium.io',             'v2', 'ciliumclusterwidenetworkpolicies'),
+        ('Calico NetworkPolicy',           'crd.projectcalico.org', 'v1', 'networkpolicies'),
+        ('Calico GlobalNetworkPolicy',     'crd.projectcalico.org', 'v1', 'globalnetworkpolicies'),
+    )
+
+    def get_cni_network_policy_counts(self, *, errors=None) -> dict:
+        """Cilium · Calico 정책 개수 (v1.4.13, 보고서 전용).
+
+        반환: {종류: 개수 | None}. CRD 가 없으면(404) 그 종류는 키 자체가 없다 — 쓰지 않는 CNI 다.
+        그 밖의 실패(권한 등)는 None = 확인 불가. 「0」 으로 적지 않는다.
+        종류마다 1건만 받고 remainingItemCount 로 개수를 센다(정책 본문을 내려받지 않는다).
+        """
+        out = {}
+        if not self.custom:
+            _collect_fail(errors, 'cni_network_policies: custom objects API 미연결')
+            return out
+        for label, group, version, plural in self._CNI_POLICY_KINDS:
+            try:
+                r = self.custom.list_cluster_custom_object(
+                    group=group, version=version, plural=plural, limit=1)
+            except Exception as e:
+                if getattr(e, 'status', None) == 404:
+                    continue
+                out[label] = None
+                _collect_fail(errors, f'cni_network_policies {label}', e)
+                continue
+            items = (r or {}).get('items') or []
+            remain = ((r or {}).get('metadata') or {}).get('remainingItemCount') or 0
+            try:
+                out[label] = len(items) + int(remain)
+            except (TypeError, ValueError):
+                out[label] = len(items)
+        return out
 
     def get_ingress_classes(self):
         if not self.net:
@@ -1824,8 +2524,9 @@ class K8sManager:
         except Exception:
             return []
 
-    def get_storage_classes(self):
+    def get_storage_classes(self, *, errors=None):
         if not self.storage:
+            _collect_fail(errors, 'storage_classes: storage API 미연결')
             return []
         try:
             return [{'name':          sc.metadata.name,
@@ -1836,11 +2537,13 @@ class K8sManager:
                          'storageclass.kubernetes.io/is-default-class', 'false'),
                      'age':           _age(sc.metadata.creation_timestamp)}
                     for sc in self.storage.list_storage_class().items]
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'storage_classes', e)
             return []
 
-    def get_rbac_summary(self):
+    def get_rbac_summary(self, *, errors=None):
         if not self.rbac:
+            _collect_fail(errors, 'rbac: rbac API 미연결')
             return {}
         try:
             crs  = self.rbac.list_cluster_role().items
@@ -1861,18 +2564,20 @@ class K8sManager:
                                                 'subjects': len(crb.subjects or [])}
                                                for crb in crbs if not crb.metadata.name.startswith('system:')][:30],
             }
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'rbac', e)
             return {}
 
     # ── RBAC 분석 뷰어 ───────────────────────────────────────────────────────
 
-    def get_rbac_roles(self, include_system: bool = False):
+    def get_rbac_roles(self, include_system: bool = False, *, errors=None):
         """Role + ClusterRole 목록 (규칙 포함).
 
         반환: [{name, namespace('' if cluster), kind('Role'|'ClusterRole'),
                 rules:[{verbs, resources, apiGroups}], rule_count, age}]
         """
         if not self.rbac:
+            _collect_fail(errors, 'rbac roles: rbac API 미연결')
             return []
         out = []
 
@@ -1899,17 +2604,18 @@ class K8sManager:
         try:
             add(self.rbac.list_cluster_role().items, 'ClusterRole')
             add(self.rbac.list_role_for_all_namespaces().items, 'Role')
-        except Exception:
-            pass
+        except Exception as e:
+            _collect_fail(errors, 'rbac roles', e)
         out.sort(key=lambda x: (x['kind'] != 'ClusterRole', x['name']))
         return out
 
-    def get_rbac_bindings(self, include_system: bool = False):
+    def get_rbac_bindings(self, include_system: bool = False, *, errors=None):
         """RoleBinding + ClusterRoleBinding 목록 (roleRef + subjects).
 
         반환: [{name, namespace, kind, role_ref:{kind,name}, subjects:[{kind,name,namespace}], age}]
         """
         if not self.rbac:
+            _collect_fail(errors, 'rbac bindings: rbac API 미연결')
             return []
         out = []
 
@@ -1937,8 +2643,8 @@ class K8sManager:
         try:
             add(self.rbac.list_cluster_role_binding().items, 'ClusterRoleBinding')
             add(self.rbac.list_role_binding_for_all_namespaces().items, 'RoleBinding')
-        except Exception:
-            pass
+        except Exception as e:
+            _collect_fail(errors, 'rbac bindings', e)
         out.sort(key=lambda x: (x['kind'] != 'ClusterRoleBinding', x['name']))
         return out
 
@@ -1956,7 +2662,7 @@ class K8sManager:
         except Exception:
             return []
 
-    def get_rbac_risky_subjects(self, include_system: bool = False):
+    def get_rbac_risky_subjects(self, include_system: bool = False, *, errors=None):
         """과도한 권한(클러스터 관리자급) 보유 subject 목록 — 보고서 보안 점검용.
 
         판정 기준:
@@ -1968,9 +2674,14 @@ class K8sManager:
                 binding, binding_kind, reason}]
         """
         try:
-            roles    = self.get_rbac_roles(include_system)
-            bindings = self.get_rbac_bindings(include_system)
-        except Exception:
+            if errors is None:
+                roles    = self.get_rbac_roles(include_system)
+                bindings = self.get_rbac_bindings(include_system)
+            else:
+                roles    = self.get_rbac_roles(include_system, errors=errors)
+                bindings = self.get_rbac_bindings(include_system, errors=errors)
+        except Exception as e:
+            _collect_fail(errors, 'rbac_risky', e)
             return []
 
         role_idx = {(r['kind'], r['name'], r['namespace']): r for r in roles}
@@ -2012,7 +2723,7 @@ class K8sManager:
                 })
         return risky
 
-    def get_kube_system_info(self):
+    def get_kube_system_info(self, *, errors=None):
         NS = 'kube-system'
         try:
             pods = self.core.list_namespaced_pod(NS).items
@@ -2031,5 +2742,6 @@ class K8sManager:
                                  'desired': ds.status.desired_number_scheduled or 0,
                                  'ready':   ds.status.number_ready or 0} for ds in dss],
             }
-        except Exception:
+        except Exception as e:
+            _collect_fail(errors, 'kube_system', e)
             return {}

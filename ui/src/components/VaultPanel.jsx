@@ -4,30 +4,31 @@ import { api } from '../api.js'
 import {
   Lock, Unlock, KeyRound, FileKey, Server, Camera, X,
   Plug, Trash2, RefreshCw, AlertCircle, CheckCircle2, ShieldCheck,
+  Pencil, Check,
 } from 'lucide-react'
 
 /**
  * VaultPanel — 보안 보관함 패널 (v1.2.1).
  *
  * 좌하단 클러스터/Vault 박스를 클릭하면 오른쪽에서 슬라이드로 열린다.
- * K8s · SSH 모드 공통. vault 에 보관된 항목을 분류해 보여주고(값은 절대 노출 X),
+ * vault 에 보관된 항목을 분류해 보여주고(값은 절대 노출 X),
  * kubeconfig 연결/삭제, 잠그기, 마스터 비밀번호 변경을 제공.
  */
 export default function VaultPanel() {
   const {
     showVaultPanel, setShowVaultPanel,
     vaultStatus, vaultLock, vaultChangePassword,
-    connectFromVault, refreshClusters, enabledFeatures,
+    connectFromVault, refreshClusters,
+    clusters, renameCluster,
   } = useApp()
 
-  // infra(SSH) plugin 미포함(무료 빌드) → SSH 접속정보는 풀 버전 기능 안내
-  const infraEnabled = Array.isArray(enabledFeatures) && enabledFeatures.includes('infra')
-
-  const [entries, setEntries] = useState({ kubeconfig: [], ssh: [], snapshot: [], other: [] })
+  const [entries, setEntries] = useState({ kubeconfig: [], snapshot: [], other: [] })
   const [snapCount, setSnapCount] = useState(0)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)        // {kind, text}
   const [showChange, setShowChange] = useState(false)
+  const [editing, setEditing] = useState(null)   // 이름 변경 중인 kubeconfig 이름 (null = 없음)
+  const [editValue, setEditValue] = useState('')
 
   const refresh = useCallback(async () => {
     const r = await api.vaultEntries()
@@ -37,7 +38,7 @@ export default function VaultPanel() {
   }, [])
 
   useEffect(() => {
-    if (showVaultPanel) { setMsg(null); setShowChange(false); refresh() }
+    if (showVaultPanel) { setMsg(null); setShowChange(false); setEditing(null); refresh() }
   }, [showVaultPanel, refresh])
 
   if (!showVaultPanel) return null
@@ -62,6 +63,30 @@ export default function VaultPanel() {
     setBusy(false)
     if (r?.ok) { setMsg({ kind: 'ok', text: `${name} 삭제됨` }); refresh() }
     else setMsg({ kind: 'error', text: r?.error || '삭제 실패' })
+  }
+
+  function startEdit(name) {
+    setMsg(null); setEditValue(name); setEditing(name)
+  }
+
+  // 이름 변경 — 이 kubeconfig 가 현재 연결된 클러스터면 rename_cluster 로 라우팅해
+  // 상위 탭(display_name)과 vault 키를 함께 바꾼다. 미연결 보관본이면 rename_kubeconfig.
+  async function handleRename(oldName) {
+    const newName = (editValue || '').trim()
+    if (!newName || newName === oldName) { setEditing(null); return }
+    setBusy(true); setMsg(null)
+    const connected = (clusters || []).find(c => c.kc_name === oldName)
+    const r = connected
+      ? await renameCluster(connected.id, newName)   // 탭 + vault 동기화
+      : await api.renameKubeconfig(oldName, newName)  // 보관본만
+    setBusy(false)
+    if (r?.ok) {
+      setEditing(null)
+      setMsg({ kind: 'ok', text: `이름 변경됨: ${oldName} → ${newName}` })
+      refresh()
+    } else {
+      setMsg({ kind: 'error', text: r?.error || '이름 변경 실패' })
+    }
   }
 
   async function handleLock() {
@@ -126,8 +151,8 @@ export default function VaultPanel() {
                 {vaultStatus.unlocked ? '앱 실행 중 보관 항목 사용 가능' : '비밀번호 입력 필요'}
               </div>
             </div>
-            <button onClick={handleLock} disabled={busy} style={lockBtn} title="잠그고 로그인 화면으로">
-              <Lock size={12} /> 잠그기
+            <button onClick={handleLock} disabled={busy} style={lockBtn} title="화면 잠금 (자리비움 보호) — 자물쇠 화면으로 전환">
+              <Lock size={12} /> 화면 잠금
             </button>
           </div>
 
@@ -155,34 +180,41 @@ export default function VaultPanel() {
               {entries.kubeconfig.map(name => (
                 <div key={name} style={rowStyle}>
                   <FileKey size={13} color="var(--blue)" style={{ flexShrink: 0 }} />
-                  <span style={rowName} title={name}>{name}</span>
-                  <button onClick={() => handleConnect(name)} disabled={busy}
-                    style={miniBtn} title="이 kubeconfig 로 연결">
-                    <Plug size={11} /> 연결
-                  </button>
-                  <button onClick={() => handleDelete(name)} disabled={busy}
-                    style={{ ...miniBtn, color: 'var(--red)' }} title="vault 에서 삭제">
-                    <Trash2 size={11} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* SSH 접속정보 그룹 — infra plugin 미포함(무료) 시 풀 버전 안내 */}
-          <GroupHeader icon={Server} title="SSH 접속정보 (password·pem키)"
-            count={infraEnabled ? (entries.ssh?.length || 0) : 'PRO'} />
-          {!infraEnabled ? (
-            <PaidHint text="SSH 인벤토리·터미널·접속정보 보관은 풀(유료) 버전 기능입니다." />
-          ) : (entries.ssh || []).length === 0 ? (
-            <EmptyHint text="보관된 SSH 접속정보가 없습니다." />
-          ) : (
-            <div style={{ marginBottom: 16 }}>
-              {entries.ssh.map(name => (
-                <div key={name} style={rowStyle}>
-                  <Server size={13} color="var(--text-mid)" style={{ flexShrink: 0 }} />
-                  <span style={rowName} title={name}>{name}</span>
-                  <span style={{ fontSize: 9.5, color: 'var(--text-dim)' }}>SSH 인벤토리에서 관리</span>
+                  {editing === name ? (
+                    <>
+                      <input autoFocus value={editValue} disabled={busy}
+                        onChange={e => setEditValue(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') handleRename(name)
+                          else if (e.key === 'Escape') setEditing(null)
+                        }}
+                        style={editInput} />
+                      <button onClick={() => handleRename(name)} disabled={busy}
+                        style={{ ...miniBtn, color: 'var(--nimbus)' }} title="이름 저장">
+                        <Check size={11} />
+                      </button>
+                      <button onClick={() => setEditing(null)} disabled={busy}
+                        style={miniBtn} title="취소">
+                        <X size={11} />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={rowName} title={name}>{name}</span>
+                      <button onClick={() => startEdit(name)} disabled={busy}
+                        style={miniBtn} title="이름 변경 (연결 중이면 상위 탭도 함께 변경)">
+                        <Pencil size={11} /> 변경
+                      </button>
+                      <button onClick={() => handleConnect(name)} disabled={busy}
+                        style={miniBtn} title="이 kubeconfig 로 연결">
+                        <Plug size={11} /> 연결
+                      </button>
+                      <button onClick={() => handleDelete(name)} disabled={busy}
+                        style={{ ...miniBtn, color: 'var(--red)' }} title="vault 에서 삭제">
+                        <Trash2 size={11} />
+                      </button>
+                    </>
+                  )}
                 </div>
               ))}
             </div>
@@ -274,19 +306,6 @@ function EmptyHint({ text }) {
   )
 }
 
-function PaidHint({ text }) {
-  return (
-    <div style={{
-      display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16,
-      padding: '9px 11px', borderRadius: 7,
-      background: 'rgba(243,201,105,0.07)', border: '1px solid rgba(243,201,105,0.28)',
-      fontSize: 11, color: 'var(--text-mid)', lineHeight: 1.6,
-    }}>
-      <Lock size={12} color="var(--nimbus)" style={{ flexShrink: 0, marginTop: 1 }} />
-      <span>{text} <span style={{ color: 'var(--text-dim)' }}>풀(유료) 버전에서 제공됩니다.</span></span>
-    </div>
-  )
-}
 
 const iconBtn = {
   width: 28, height: 28, display: 'grid', placeItems: 'center',
@@ -307,6 +326,11 @@ const rowStyle = {
 const rowName = {
   flex: 1, minWidth: 0, fontSize: 12, color: 'var(--text-bright)',
   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+}
+const editInput = {
+  flex: 1, minWidth: 0, padding: '4px 8px', fontSize: 12,
+  background: 'var(--bg-3)', border: '1px solid var(--nimbus)',
+  borderRadius: 5, color: 'var(--text-bright)', outline: 'none',
 }
 const miniBtn = {
   display: 'inline-flex', alignItems: 'center', gap: 4,

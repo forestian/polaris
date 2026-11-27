@@ -1,0 +1,22 @@
+# Dependabot — 의존성 자동 업데이트 (공개 GitHub 빌드).
+# 배포 시 .github/dependabot.yml 로 복사됨.
+# 효과: OpenSSF Scorecard "Dependency-Update-Tool" 통과 + 신규 취약점 자동 PR.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

@@ -155,7 +155,7 @@ class PortForwardMixin:
     def start_port_forward(self, kind: str, ns: str, name: str, local_port, remote_port):
         if not self.k8s.kubeconfig:
             return {'ok': False, 'error': 'cluster is not connected'}
-        kubectl = _find_kubectl()
+        kubectl = _find_kubectl(self.k8s.kubeconfig)
         if not kubectl:
             return {'ok': False, 'error': 'kubectl was not found'}
         try:

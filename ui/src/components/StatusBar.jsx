@@ -1,8 +1,17 @@
 import React from 'react'
 import { useApp } from '../store.jsx'
 
+/**
+ * 하단 상태 표시줄 — 클러스터 연결 상태와 판.
+ */
 export default function StatusBar() {
   const { connected, kubeVersion, appVersion, clusterName } = useApp()
+
+  const dot = connected ? 'var(--nimbus)' : 'var(--red)'
+  const text = connected ? `연결됨${clusterName ? ` · ${clusterName}` : ''}` : '연결 안 됨'
+  const color = connected ? 'var(--text)' : 'var(--red)'
+  const strong = !connected
+  const extra = connected && kubeVersion ? `k8s ${kubeVersion}` : null
 
   return (
     <div style={{
@@ -13,28 +22,23 @@ export default function StatusBar() {
       padding: '0 14px', flexShrink: 0,
       fontSize: 10.5,
     }}>
-      {/* 연결 상태 */}
       <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <span style={{
           width: 6, height: 6, borderRadius: '50%',
-          background: connected ? 'var(--nimbus)' : 'var(--red)',
-          boxShadow: connected ? '0 0 5px var(--nimbus)' : 'none',
+          background: dot,
+          boxShadow: dot === 'var(--nimbus)' ? '0 0 5px var(--nimbus)' : 'none',
           display: 'inline-block', flexShrink: 0,
         }} />
-        <span style={{ color: connected ? 'var(--text)' : 'var(--red)', fontWeight: connected ? 400 : 600 }}>
-          {connected ? `연결됨${clusterName ? ` · ${clusterName}` : ''}` : '연결 안 됨'}
-        </span>
+        <span style={{ color, fontWeight: strong ? 600 : 400 }}>{text}</span>
       </span>
 
-      {connected && kubeVersion && (
-        <span style={{ color: 'var(--text-dim)', marginLeft: 12 }}>k8s {kubeVersion}</span>
-      )}
+      {extra && <span style={{ color: 'var(--text-dim)', marginLeft: 12 }}>{extra}</span>}
 
       <span style={{ flex: 1 }} />
 
-      <span style={{ color: 'var(--text-dim)' }}>F5 새로고침 · ⌘K 검색</span>
+      <span style={{ color: 'var(--text-dim)' }}>Ctrl+K 검색</span>
       <span style={{ marginLeft: 14, color: 'var(--text-mid)', fontWeight: 500 }}>
-        {appVersion ? `Polaris v${appVersion}` : 'Polaris'}
+        {appVersion ? `Polaris Free v${appVersion}` : 'Polaris Free'}
       </span>
     </div>
   )

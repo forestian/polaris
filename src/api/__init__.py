@@ -35,18 +35,21 @@ from .logs         import LogsMixin
 from .topology     import TopologyMixin
 from .snapshots    import SnapshotsMixin
 from .vault        import VaultMixin
+from .aiops        import AIOpsMixin
+from .upgradecheck import UpgradeCheckMixin   # CHECK 탭 업그레이드 사전 점검 (v1.4.1)
 
 # ── 코어 mixin 목록 (항상 포함) ─────────────────────────────────────────────
 _CORE_MIXINS = [
     ResourcesMixin, TerminalMixin, PortForwardMixin,
     ReportsMixin, DetailsMixin, LogsMixin, TopologyMixin,
-    SnapshotsMixin, VaultMixin,
+    SnapshotsMixin, VaultMixin, AIOpsMixin, UpgradeCheckMixin,
 ]
 
 # 자동 발견에서 제외할 모듈 (코어 + 내부 헬퍼)
 _CORE_MODULE_NAMES = {
     '__init__', 'base', 'resources', 'terminal', 'port_forward',
-    'reports', 'details', 'logs', 'topology', 'snapshots', 'vault',
+    'reports', 'details', 'logs', 'topology', 'snapshots', 'vault', 'aiops',
+    'upgradecheck',
 }
 
 
@@ -54,7 +57,7 @@ def _discover_optional_mixins():
     """src/api/ 패키지에서 코어가 아닌 *Mixin 클래스를 자동 등록.
 
     반환: [(feature_id, MixinClass), ...]
-        feature_id 는 모듈명 (예: 'catalog').
+        feature_id 는 모듈명 (예: 'yamllab').
 
     ▸ 개발 환경: 파일시스템의 *.py 를 pkgutil.iter_modules 로 열거.
     ▸ PyInstaller frozen EXE: glob('*.py') 는 PYZ 아카이브 안의 파일을 찾지
@@ -125,8 +128,3 @@ class PolarisAPI(*_MIXINS, APIBase):
     """
     pass
 
-
-# ── 하위 호환 alias ───────────────────────────────────────────────────────────
-# v1.0.9 까지 HAS_CATALOG 를 사용한 외부 코드 (UI / 테스트) 를 위한 별칭.
-# 새 코드는 'catalog' in ENABLED_FEATURES 형태를 사용 권장.
-HAS_CATALOG = 'catalog' in ENABLED_FEATURES

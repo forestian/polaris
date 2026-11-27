@@ -1,8 +1,6 @@
 """Polaris 비밀 저장소 (Vault).
 
-infra 플러그인 (SSH 접속정보, sudo password, ansible vault 등) 의 민감
-데이터를 디스크에 안전하게 보관하기 위한 코어 모듈. 다른 기능에서도
-재사용 가능하도록 src/ 코어에 둠 (infra 플러그인이 제외돼도 vault 는 남음).
+kubeconfig · 토큰 같은 민감 데이터를 디스크에 안전하게 보관하기 위한 코어 모듈.
 
 설계 원칙
 ─────────────────────────────────────────────────────────────────────────
@@ -10,12 +8,18 @@ infra 플러그인 (SSH 접속정보, sudo password, ansible vault 등) 의 민�
    는 절대 변경 금지. _read_v1() 는 영원히 보존되며, CI 의 회귀 fixture
    (VAULT_V1_FIXTURE) 가 매 릴리스에서 v1 호환을 강제 검증.
 
-2. 이중 잠금. 같은 DEK 를 두 가지 방법으로 wrap:
-     - DPAPI(DEK)         → 같은 Windows 사용자에서 자동 복호화 (편의)
+2. 다중 잠금. 같은 DEK 를 여러 방법으로 wrap:
+     - DPAPI(DEK)         → 같은 Windows 사용자에서 자동 복호화 (GUI 편의)
      - AES-GCM(DEK, KEK)  → 마스터 패스워드 파생 KEK (복구 / 이동)
+     - AES-GCM(DEK, TKEK) → MCP 액세스 토큰 파생 TKEK (v1.2.119~, 0~N개)
    일상에서는 DPAPI 로 무프롬프트, Windows 프로필 손상 시 마스터 패스워드
    로 fallback. Xshell 의 "session encryption + master password" 모델과
    동일한 UX 보장.
+
+   ★ DPAPI 는 Polaris GUI 전용이다. 헤드리스 MCP 서버는 DPAPI 를 쓰지 않고
+   반드시 토큰으로만 연다 — 자동 잠금 해제를 켰다고 해서 외부 AI 가 vault 에
+   닿을 수 있으면 안 되기 때문. 토큰은 개별 폐기·범위 제한·만료가 되고,
+   감사 로그에 어느 토큰이 호출했는지 남는다.
 
 3. Stdlib + cryptography 만 사용. argon2 같은 native 의존성 회피해
    PyInstaller 빌드 안정성 확보. KDF 는 `hashlib.scrypt` (memory-hard,
@@ -42,14 +46,20 @@ infra 플러그인 (SSH 접속정보, sudo password, ansible vault 등) 의 민�
 """
 import os
 import json
+import time
+import contextlib
 import base64
 import hashlib
+import hmac
+import re
 import secrets
 import threading
 import ctypes
 from ctypes import wintypes
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from src import winsec   # 파일/폴더 권한 하드닝 (best-effort, v1.2.3)
 
 # cryptography 는 AES-256-GCM AEAD 표준 구현체.
 # PyInstaller 자동 hook 으로 frozen 빌드에 포함됨.
@@ -78,6 +88,29 @@ _V1_AEAD_ALGO   = 'AES-256-GCM'
 _V1_KEY_BYTES   = 32   # DEK / KEK 길이
 _V1_NONCE_BYTES = 12   # GCM 권장
 _V1_TAG_BYTES   = 16   # GCM 표준
+
+# MCP 액세스 토큰 (v1.2.119) — token_deks 는 v1 포맷의 **선택** 키다.
+# 없으면 없는 대로 동작하므로 기존 vault 를 그대로 연다(_read_v1 필수 키 불변).
+_MCP_TOKEN_PREFIX = 'plrs_mcp_'   # 시크릿 스캐너·사람 눈에 띄도록 고정 접두사
+_MCP_TOKEN_BYTES  = 32            # 토큰 비밀값 (CSPRNG)
+_MCP_TOKEN_INFO   = b'polaris-mcp-token-v1'   # HKDF info — 영구 고정
+_MCP_SCOPES       = ('read', 'write')
+_MCP_TOKEN_RE = re.compile(r'^' + re.escape(_MCP_TOKEN_PREFIX) +
+                           r'([0-9a-f]{8})_([A-Za-z0-9+/=_-]{40,})$')
+
+
+def _parse_mcp_token(token: str):
+    """'plrs_mcp_<id>_<secret_b64>' → (id, secret_bytes). 형식 불일치면 None."""
+    m = _MCP_TOKEN_RE.match((token or '').strip())
+    if not m:
+        return None
+    try:
+        secret = _b64d(m.group(2))
+    except Exception:
+        return None
+    if len(secret) != _MCP_TOKEN_BYTES:
+        return None
+    return m.group(1), secret
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,7 +282,7 @@ class Vault:
         v.lock()  # 종료 시
     """
 
-    DEFAULT_PATH = Path.home() / '.polaris' / 'vault.json'
+    DEFAULT_PATH = Path.home() / '.polaris-free' / 'vault.json'
 
     def __init__(self, path: Path | None = None):
         if not HAS_CRYPTO:
@@ -259,6 +292,7 @@ class Vault:
         self.path: Path = Path(path) if path else self.DEFAULT_PATH
         self._dek: bytearray | None = None   # 잠금 해제 시 로드, lock() 시 zero out
         self._data: dict | None = None       # 디스크 파일 내용
+        self._sig: tuple | None = None       # _data 를 읽거나 쓸 때의 파일 (mtime_ns, size) — v1.5.6
         self._lock = threading.Lock()
 
     # ── 상태 ───────────────────────────────────────────────────────────────
@@ -295,10 +329,12 @@ class Vault:
         if not self.exists:
             raise VaultNotFound(f'vault 파일 없음: {self.path}')
         try:
+            sig = self._disk_sig()                # 읽기 **전에** 잰다 — 읽는 사이 바뀌면 다음에 다시 읽는다
             raw = self.path.read_text(encoding='utf-8')
             obj = json.loads(raw)
         except json.JSONDecodeError as e:
             raise VaultCorrupted(f'JSON 파싱 실패: {e}') from e
+        self._sig = sig
 
         ver = obj.get('format_version')
         if ver == 1:
@@ -322,7 +358,79 @@ class Vault:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, self.path)   # Windows / POSIX 모두 atomic
+        winsec.chmod_owner_only(tmp)         # rename 전 소유자 전용 (POSIX)
+        os.replace(tmp, self.path)           # Windows / POSIX 모두 atomic
+        winsec.chmod_owner_only(self.path)   # 최종 파일도 명시 (v1.2.3)
+        self._sig = self._disk_sig()
+
+    # ── 여러 프로세스가 같은 파일을 쓴다 (v1.5.6) ──────────────────────────
+    # Polaris 창과 MCP 서버(polaris.exe --mcp)는 **다른 프로세스**다. 예전에는 각자 열 때 한 번 읽은 내용을 끝까지
+    # 들고 있어서 ① 창에서 저장한 서버 비밀번호를 이미 떠 있는 MCP 가 못 봤고(has_password false · 「비밀이 저장돼
+    # 있지 않습니다」, 2026-11-05 신고) ② 한쪽이 저장하면 자기 옛 사본을 통째로 써서 다른 쪽이 그사이 넣은 비밀을
+    # 지울 수 있었다. 이제 읽기 전에는 파일이 바뀌었으면 다시 읽고, 쓰기는 파일 잠금을 잡은 채 최신 파일 위에 고친다.
+    def _disk_sig(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _refresh(self) -> None:
+        """(self._lock 안에서) 다른 프로세스가 파일을 바꿨으면 다시 읽는다. DEK 는 그대로 — 비밀번호를 바꿔도
+        DEK 는 같고(change_master_password 는 재래핑만), vault 를 새로 만든 경우는 복호화가 실패해 드러난다."""
+        if self._data is None or not self.exists:
+            return
+        if self._disk_sig() != self._sig:
+            self._load()
+
+    @contextlib.contextmanager
+    def _file_lock(self, timeout: float = 10.0):
+        """다른 프로세스와 동시에 고치지 않게 — vault.json.lock 을 잡는다(윈도우 msvcrt · 그 밖 fcntl)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lp = self.path.with_suffix(self.path.suffix + '.lock')
+        fh = open(lp, 'a+b')
+        got = False
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    if os.name == 'nt':
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = True
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise VaultError('다른 Polaris 가 보안 보관함을 쓰는 중입니다 — 잠시 뒤 다시 하세요.')
+                    time.sleep(0.05)
+            yield
+        finally:
+            if got:
+                try:
+                    if os.name == 'nt':
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
+
+    @contextlib.contextmanager
+    def _mutate(self):
+        """고치기 — (self._lock 안에서) 파일 잠금 → 최신 파일 다시 읽기 → 고치기(호출자) → _save."""
+        with self._file_lock():
+            if self._data is None:
+                self._load()
+            else:
+                self._refresh()
+            yield
 
     # ── 생성 ───────────────────────────────────────────────────────────────
     def create(self, master_password: str) -> None:
@@ -369,6 +477,9 @@ class Vault:
             }
             self._dek = bytearray(dek)
             self._save()
+            # vault 가 놓인 폴더의 ACL 을 현재 사용자 전용으로 조임 (best-effort).
+            # 데이터 폴더가 권한이 느슨한 위치로 이전된 경우의 노출 방지 (v1.2.3).
+            winsec.harden_dir(self.path.parent)
 
     # ── 잠금 해제 ──────────────────────────────────────────────────────────
     def unlock_dpapi(self) -> bool:
@@ -423,21 +534,156 @@ class Vault:
     def enable_dpapi(self) -> None:
         with self._lock:
             self._require_unlocked()
-            if self._data is None:
-                self._load()
             blob = dpapi_protect(bytes(self._dek))   # DPAPIUnavailable 가능
-            self._data['dpapi_dek'] = _b64e(blob)
-            self._save()
+            with self._mutate():
+                self._data['dpapi_dek'] = _b64e(blob)
+                self._save()
 
     def disable_dpapi(self) -> None:
         with self._lock:
+            if not self.exists:
+                return
+            with self._mutate():
+                if self._data.get('dpapi_dek'):
+                    self._data['dpapi_dek'] = None
+                    self._save()
+
+    # ── MCP 액세스 토큰 (v1.2.119) ─────────────────────────────────────────
+    # DEK 를 토큰 파생 키(TKEK)로 한 번 더 wrap 해서 token_deks[<id>] 에 둔다.
+    # 헤드리스 MCP 서버가 DPAPI 없이 vault 를 여는 유일한 경로.
+    #
+    # 토큰 문자열:  plrs_mcp_<id>_<secret_b64url>
+    #   - id     : 공개 식별자. 감사 로그·UI 목록에 노출해도 안전
+    #   - secret : CSPRNG 32B. 발급 시 1회만 표시하고 어디에도 저장하지 않음
+    #              (디스크에는 secret 으로만 풀리는 wrapped DEK 만 남는다)
+    #
+    # secret 이 이미 고엔트로피라 scrypt 같은 느린 KDF 는 불필요 —
+    # HKDF-SHA256(RFC 5869) 1블록으로 TKEK 를 유도한다.
+    def issue_mcp_token(self, label: str = '', scope: str = 'read',
+                        expires_days: int = 90) -> str:
+        """토큰 발급 → 전체 토큰 문자열 반환(호출자가 1회 표시하고 버릴 것).
+
+        vault 가 열려 있어야 한다(발급 = 현재 DEK 를 토큰 키로 재래핑).
+        """
+        if scope not in _MCP_SCOPES:
+            raise ValueError(f'scope 는 {sorted(_MCP_SCOPES)} 중 하나여야 합니다.')
+        with self._lock, self._mutate():
+            self._require_unlocked()
+            tid = secrets.token_hex(4)
+            while tid in (self._data.get('token_deks') or {}):
+                tid = secrets.token_hex(4)
+            tsecret = secrets.token_bytes(_MCP_TOKEN_BYTES)
+            tsalt = secrets.token_bytes(_V1_SALT_BYTES)
+            tkek = self._derive_token_key(tsecret, tsalt)
+
+            now = datetime.now(timezone.utc)
+            rec = {
+                'wrapped':    self._aead_encrypt(bytes(self._dek), tkek),
+                'salt':       _b64e(tsalt),
+                'label':      (label or '').strip()[:60],
+                'scope':      scope,
+                'created_at': now.isoformat(),
+                'expires_at': (now + timedelta(days=int(expires_days))).isoformat()
+                              if expires_days else None,
+                'last_used_at': None,
+            }
+            self._data.setdefault('token_deks', {})[tid] = rec
+            self._save()
+            return f'{_MCP_TOKEN_PREFIX}{tid}_{_b64e(tsecret)}'
+
+    def unlock_token(self, token: str) -> dict | None:
+        """MCP 토큰으로 잠금 해제. 성공 시 토큰 메타(id/scope/label), 실패 시 None.
+
+        만료된 토큰은 열지 않는다. 성공하면 last_used_at 을 갱신한다.
+        """
+        parsed = _parse_mcp_token(token)
+        if parsed is None:
+            return None
+        tid, tsecret = parsed
+        with self._lock:
             if self._data is None:
                 if not self.exists:
-                    return
+                    return None
                 self._load()
-            if self._data.get('dpapi_dek'):
-                self._data['dpapi_dek'] = None
+            else:
+                self._refresh()                  # 창에서 폐기한 토큰을 옛 사본으로 받아 주지 않게(v1.5.6)
+            rec = (self._data.get('token_deks') or {}).get(tid)
+            if not rec:
+                return None
+            exp = rec.get('expires_at')
+            if exp:
+                try:
+                    if datetime.now(timezone.utc) > datetime.fromisoformat(exp):
+                        return None
+                except ValueError:
+                    return None
+            try:
+                tkek = self._derive_token_key(tsecret, _b64d(rec['salt']))
+                dek = self._aead_decrypt(rec['wrapped'], tkek)
+            except Exception:
+                return None                      # 위조/변조 토큰 — 원인 노출 안 함
+            if len(dek) != _V1_KEY_BYTES:
+                return None
+            self._dek = bytearray(dek)
+            try:
+                with self._mutate():
+                    cur = (self._data.get('token_deks') or {}).get(tid)
+                    if cur is not None:
+                        cur['last_used_at'] = datetime.now(timezone.utc).isoformat()
+                        self._save()
+            except Exception:
+                pass                             # 사용시각 기록 실패가 해제를 막지 않음
+            return {'id': tid, 'scope': rec.get('scope', 'read'),
+                    'label': rec.get('label', '')}
+
+    def list_mcp_tokens(self) -> list[dict]:
+        """발급된 토큰 목록 (비밀값·wrapped 는 반환하지 않음)."""
+        with self._lock:
+            if self._data is None:
+                if not self.exists:
+                    return []
+                self._load()
+            else:
+                self._refresh()
+            now = datetime.now(timezone.utc)
+            out = []
+            for tid, rec in sorted((self._data.get('token_deks') or {}).items(),
+                                   key=lambda kv: kv[1].get('created_at') or ''):
+                expired = False
+                if rec.get('expires_at'):
+                    try:
+                        expired = now > datetime.fromisoformat(rec['expires_at'])
+                    except ValueError:
+                        expired = True
+                out.append({
+                    'id': tid, 'label': rec.get('label', ''),
+                    'scope': rec.get('scope', 'read'),
+                    'created_at': rec.get('created_at'),
+                    'expires_at': rec.get('expires_at'),
+                    'last_used_at': rec.get('last_used_at'),
+                    'expired': expired,
+                })
+            return out
+
+    def revoke_mcp_token(self, token_id: str) -> bool:
+        """토큰 폐기. 지워지면 True. (vault 잠금 여부와 무관하게 가능)"""
+        with self._lock:
+            if not self.exists:
+                return False
+            with self._mutate():
+                toks = self._data.get('token_deks') or {}
+                if token_id not in toks:
+                    return False
+                del toks[token_id]
+                self._data['token_deks'] = toks
                 self._save()
+                return True
+
+    @staticmethod
+    def _derive_token_key(secret: bytes, salt: bytes) -> bytes:
+        """HKDF-SHA256 1블록. secret 이 CSPRNG 32B 라 느린 KDF 불필요."""
+        prk = hmac.new(salt, secret, hashlib.sha256).digest()          # extract
+        return hmac.new(prk, _MCP_TOKEN_INFO + b'\x01', hashlib.sha256).digest()
 
     # ── 비밀 CRUD ──────────────────────────────────────────────────────────
     def store(self, key: str, secret: str) -> None:
@@ -447,13 +693,15 @@ class Vault:
             self._require_key(key)
             blob = self._aead_encrypt(secret.encode('utf-8'), bytes(self._dek))
             blob['updated_at'] = datetime.now(timezone.utc).isoformat()
-            self._data['secrets'][key] = blob
-            self._save()
+            with self._mutate():                 # 다른 프로세스가 그사이 넣은 비밀을 지우지 않게(v1.5.6)
+                self._data['secrets'][key] = blob
+                self._save()
 
     def retrieve(self, key: str) -> str:
         """비밀 조회. 없으면 KeyError."""
         with self._lock:
             self._require_unlocked()
+            self._refresh()
             if key not in self._data['secrets']:
                 raise KeyError(key)
             blob = self._data['secrets'][key]
@@ -464,21 +712,24 @@ class Vault:
         """비밀 삭제. 존재하면 True."""
         with self._lock:
             self._require_unlocked()
-            if key in self._data['secrets']:
-                del self._data['secrets'][key]
-                self._save()
-                return True
-            return False
+            with self._mutate():
+                if key in self._data['secrets']:
+                    del self._data['secrets'][key]
+                    self._save()
+                    return True
+                return False
 
     def has(self, key: str) -> bool:
         with self._lock:
             self._require_unlocked()
+            self._refresh()
             return key in self._data['secrets']
 
     def list_keys(self) -> list[str]:
         """저장된 key 목록 (값은 노출 안 함)."""
         with self._lock:
             self._require_unlocked()
+            self._refresh()
             return sorted(self._data['secrets'].keys())
 
     # ── 임의 blob 암복호화 (vault.json 외부 파일 암호화용 — 예: 스냅샷) ───────
@@ -501,16 +752,20 @@ class Vault:
         """마스터 패스워드 교체. DEK 는 그대로 — KEK 만 재유도 후 재래핑."""
         if not new:
             raise ValueError('새 마스터 패스워드가 비어 있습니다.')
-        with self._lock:
-            # old 검증을 위해 임시 unlock 시도
-            if self._dek is None:
+        with self._lock, self._mutate():
+            # 현재 비밀번호는 잠금 여부와 상관없이 항상 확인한다(v1.5.28 검토 — 예전엔 열려 있으면 확인 없이
+            # 바꿔, 자리 비운 사이 누구나 「현재 비밀번호」 칸을 아무렇게나 채우고 마스터 비밀번호를 가로챌 수 있었다)
+            if self._dek is None or not getattr(self, '_data', None):
                 self._load()
-                salt = _b64d(self._data['kdf']['salt'])
-                kek_old = self._derive_kek_v1(old, salt)
-                try:
-                    dek = self._aead_decrypt(self._data['master_dek'], kek_old)
-                except Exception as e:
-                    raise InvalidMasterPassword('현재 마스터 패스워드가 일치하지 않습니다.') from e
+            salt = _b64d(self._data['kdf']['salt'])
+            kek_old = self._derive_kek_v1(old or '', salt)
+            try:
+                dek = self._aead_decrypt(self._data['master_dek'], kek_old)
+            except Exception as e:
+                raise InvalidMasterPassword('현재 마스터 패스워드가 일치하지 않습니다.') from e
+            if self._dek is not None and not secrets.compare_digest(bytes(dek), bytes(self._dek)):
+                raise InvalidMasterPassword('현재 마스터 패스워드가 일치하지 않습니다.')
+            if self._dek is None:
                 self._dek = bytearray(dek)
 
             # 새 salt + 새 KEK 로 DEK 재래핑

@@ -6,8 +6,8 @@
 
 스냅샷 데이터는 _report_collect() 가 수집한 dict 를 그대로 사용 (별도 수집 로직 없음).
 저장 위치:
-  ~/.polaris/snapshots/<cluster>_<timestamp>.enc   ← 암호화 (v1.2.1~, 기본)
-  ~/.polaris/snapshots/<cluster>_<timestamp>.json  ← 평문 (구버전 / crypto 없음)
+  ~/.polaris-free/snapshots/<cluster>_<timestamp>.enc   ← 암호화 (v1.2.1~, 기본)
+  ~/.polaris-free/snapshots/<cluster>_<timestamp>.json  ← 평문 (구버전 / crypto 없음)
 
 암호화(.enc): 민감한 클러스터 상태(data)는 vault DEK 로 AES-256-GCM 암호화되어
 raw 파일로 열어도 내용을 알아볼 수 없다. meta(요약)만 평문으로 봉투에 남겨 목록을

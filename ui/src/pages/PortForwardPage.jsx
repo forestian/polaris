@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { startPoll } from '../poll.js'
 import { api } from '../api.js'
 import { useApp } from '../store.jsx'
 import {
@@ -119,8 +120,7 @@ export default function PortForwardPage() {
   useEffect(() => { refreshSessions() }, [refreshSessions])
   useEffect(() => {
     if (!windowVisible) return
-    const id = setInterval(refreshSessions, 2000)
-    return () => clearInterval(id)
+    return startPoll(refreshSessions, 2000)
   }, [refreshSessions, windowVisible])
 
   const targetList = kind === 'service' ? targets.services : targets.pods

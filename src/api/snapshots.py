@@ -32,15 +32,12 @@ class SnapshotsMixin:
                 data['_findings'] = _report_evaluate(data)
             except Exception:
                 data['_findings'] = []
-            cluster = (self.k8s.cluster_info.get('context')
-                       or self._active_cluster_name() or 'cluster')
-            return save_snapshot(data, cluster, label, vault=self._snapshot_vault())
+            # 보관함에 저장한 이름 우선 — context 를 앞에 두면 RKE2 클러스터가 전부
+            # 'default' 로 저장돼 목록에서 구분이 안 된다. _cluster_label 이 APIBase 에 있다.
+            return save_snapshot(data, self._cluster_label(), label,
+                                 vault=self._snapshot_vault())
         except Exception as e:
             return {'ok': False, 'error': str(e)}
-
-    def _active_cluster_name(self) -> str:
-        info = self._clusters.get(self._active_id or '', {})
-        return info.get('display_name', '')
 
     def list_snapshots(self) -> dict:
         """저장된 스냅샷 목록."""
